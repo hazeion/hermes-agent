@@ -95,6 +95,8 @@ GET  /v1/runs/{id}/events        SSE stream of lifecycle events
 POST /v1/runs/{id}/approval      Resolve an exact pending approval by request_id
 POST /v1/runs/{id}/clarification Answer an exact pending clarification
 POST /v1/runs/{id}/stop          Interrupt the run
+GET  /v1/kanban/boards           Bounded bearer-authenticated Kanban boards
+GET/POST /v1/kanban/tasks        Revision-aware Kanban task records/actions
 GET  /v1/capabilities            Machine-readable feature flags
 GET  /v1/models                  Lists hermes-agent
 GET  /v1/profiles                Complete, API-key-authenticated profile IDs
