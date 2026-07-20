@@ -336,6 +336,26 @@ input. Once accepted, the turn uses the normal Runs status, events, approval,
 and stop endpoints. Descriptors are authenticated binding data, not bearer
 credentials or durable leases.
 
+When a controllable run needs an image, `input` may instead be a compact
+OpenAI-style content-part array:
+
+```json
+{
+  "input": [
+    {"type": "input_text", "text": "Describe this screenshot."},
+    {"type": "input_image", "image_url": "data:image/png;base64,..."}
+  ]
+}
+```
+
+Runs accepts up to four inline PNG, JPEG, GIF, or WebP images, each up to 5
+MiB. It deliberately accepts only `data:image/...;base64` values—no web URLs,
+file uploads, or local paths—so this controllable endpoint cannot fetch a
+private network URL or inspect the Hermes host. The same Run keeps its usual
+status, events, approval, and stop controls. Discover the exact version and
+limits through `features.run_inline_images` and `endpoints.run_inline_images`
+in `/v1/capabilities` before sending images.
+
 ### GET /v1/runs/\{run_id\}
 
 Poll the current run state. This is useful for dashboards that need status without holding an SSE connection open, or for UIs that reconnect after navigation.

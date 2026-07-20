@@ -1229,6 +1229,9 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_clarification_request_binding"] is True
             assert data["features"]["run_clarification_prompt_version"] == 1
             assert data["features"]["clarification_events"] is True
+            assert data["features"]["run_inline_images"] is True
+            assert data["features"]["run_inline_images_version"] == 1
+            assert data["features"]["run_inline_images_data_urls_only"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["features"]["profile_inventory"] is False
             assert data["features"]["profile_inventory_version"] == 1
@@ -1240,6 +1243,16 @@ class TestCapabilitiesEndpoint:
                 "path": "/v1/runs/{run_id}/clarification",
             }
             assert data["endpoints"]["profiles"] == {"method": "GET", "path": "/v1/profiles"}
+            assert data["endpoints"]["run_inline_images"] == {
+                "method": "POST",
+                "path": "/v1/runs",
+                "version": 1,
+                "input": "OpenAI content parts: input_text and input_image",
+                "image_transport": "data_url_only",
+                "mime_types": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+                "max_count": 4,
+                "max_bytes_per_image": 5 * 1024 * 1024,
+            }
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
 
