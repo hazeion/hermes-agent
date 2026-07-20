@@ -97,6 +97,7 @@ POST /v1/runs/{id}/clarification Answer an exact pending clarification
 POST /v1/runs/{id}/stop          Interrupt the run
 GET  /v1/capabilities            Machine-readable feature flags
 GET  /v1/models                  Lists hermes-agent
+GET  /v1/profiles                Complete, API-key-authenticated profile IDs
 GET  /health, /health/detailed
 ```
 
