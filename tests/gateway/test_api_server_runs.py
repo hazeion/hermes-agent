@@ -1068,6 +1068,8 @@ class TestRunEvents:
 
         assert response.status == 400
         assert data["error"]["code"] == "invalid_approval_request_id"
+
+    @pytest.mark.asyncio
     async def test_clarification_event_waits_for_exact_choice_response(self, adapter):
         app = _create_runs_app(adapter)
         callback_result = {}
