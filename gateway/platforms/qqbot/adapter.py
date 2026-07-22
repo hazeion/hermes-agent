@@ -2684,6 +2684,7 @@ class QQAdapter(BasePlatformAdapter):
             description: str = "dangerous command",
             metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
+        allow_session: bool = True,
         smart_denied: bool = False,
     ) -> SendResult:
         """Send a button-based exec-approval prompt for a dangerous command.
@@ -2697,6 +2698,7 @@ class QQAdapter(BasePlatformAdapter):
         if not request_id:
             request_id = uuid.uuid4().hex
         self._exec_approval_state[request_id] = session_key
+        del allow_session  # QQ's 3-button keyboard has no session tier (once/always/deny).
         if smart_denied:
             description += " Owner override applies to this one operation only."
 

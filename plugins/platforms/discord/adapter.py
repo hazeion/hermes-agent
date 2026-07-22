@@ -1037,6 +1037,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """Connect to Discord and start receiving events."""
         if not DISCORD_AVAILABLE:
             logger.error("[%s] discord.py not installed. Run: pip install discord.py", self.name)
+            self._set_fatal_error("missing_dependency", "discord.py not installed", retryable=False)
             return False
 
         # Load opus codec for voice channel support
@@ -1073,6 +1074,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if not self.config.token:
             logger.error("[%s] No bot token configured", self.name)
+            self._set_fatal_error("missing_credentials", "No bot token configured", retryable=False)
             return False
 
         try:
@@ -6454,6 +6456,7 @@ class DiscordAdapter(BasePlatformAdapter):
         description: str = "dangerous command",
         metadata: Optional[dict] = None,
         allow_permanent: bool = True,
+        allow_session: bool = True,
         smart_denied: bool = False,
     ) -> SendResult:
         """
@@ -6531,6 +6534,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 require_admin=require_admin,
                 admin_user_ids=admin_user_ids,
                 allow_permanent=allow_permanent,
+                allow_session=allow_session,
                 smart_denied=smart_denied,
             )
 
@@ -7795,6 +7799,7 @@ def _define_discord_view_classes() -> None:
             require_admin: bool = False,
             admin_user_ids: Optional[set] = None,
             allow_permanent: bool = True,
+            allow_session: bool = True,
             smart_denied: bool = False,
             request_id: str = "",
         ):
@@ -7811,7 +7816,7 @@ def _define_discord_view_classes() -> None:
                 str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()
             }
             self.resolved = False
-            if smart_denied:
+            if smart_denied or not allow_session:
                 self.remove_item(self.allow_session)
                 self.remove_item(self.allow_always)
             elif not allow_permanent:
@@ -7869,19 +7874,9 @@ def _define_discord_view_classes() -> None:
 
             self.resolved = True
 
-            # Update the embed with the decision
-            embed = interaction.message.embeds[0] if interaction.message.embeds else None
-            if embed:
-                embed.color = color
-                embed.set_footer(text=f"{label} by {interaction.user.display_name}")
-
-            # Disable all buttons
-            for child in self.children:
-                child.disabled = True
-
-            await interaction.response.edit_message(embed=embed, view=self)
-
-            # Unblock the waiting agent thread via the gateway approval queue
+            # Unblock the waiting agent thread FIRST, then render the outcome.
+            # A click that lands after the approval wait timed out (count == 0)
+            # must not claim "Approved" — the command was already denied.
             try:
                 from tools.approval import resolve_gateway_approval
                 if self.request_id:
@@ -7896,6 +7891,24 @@ def _define_discord_view_classes() -> None:
                 )
             except Exception as exc:
                 logger.error("Failed to resolve gateway approval from button: %s", exc)
+                count = 0
+
+            if not count:
+                color = discord.Color.dark_grey()
+                label = "⌛ Approval expired — command was not run (already timed out or resolved elsewhere)"
+
+            # Update the embed with the decision
+            embed = interaction.message.embeds[0] if interaction.message.embeds else None
+            if embed:
+                embed.color = color
+                footer = f"{label} by {interaction.user.display_name}" if count else label
+                embed.set_footer(text=footer)
+
+            # Disable all buttons
+            for child in self.children:
+                child.disabled = True
+
+            await interaction.response.edit_message(embed=embed, view=self)
 
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(
@@ -9470,7 +9483,7 @@ def register(ctx) -> None:
         check_fn=check_discord_requirements,
         is_connected=_is_connected,
         required_env=["DISCORD_BOT_TOKEN"],
-        install_hint="pip install 'hermes-agent[messaging]'",
+        install_hint="Run `hermes setup` to install Discord support.",
         # Interactive setup wizard — replaces the central
         # hermes_cli/setup.py::_setup_discord function.  Same shape as Teams.
         setup_fn=interactive_setup,
