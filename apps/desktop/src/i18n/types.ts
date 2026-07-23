@@ -218,6 +218,15 @@ export interface Translations {
     message: (reason: string) => string
   }
 
+  billingBlock: {
+    titleNous: string
+    titleProvider: (provider: string) => string
+    fallbackMessage: string
+    openBilling: string
+    addCredits: string
+    dismiss: string
+  }
+
   titlebar: {
     hideSidebar: string
     showSidebar: string
@@ -2039,6 +2048,7 @@ export interface Translations {
     closeOthers: string
     closeToRight: string
     closeAll: string
+    newSessionTab: string
     split: (dir: string) => string
     move: (dir: string) => string
     dirUp: string
@@ -2130,6 +2140,9 @@ export interface Translations {
       skip: string
       skipped: string
       continueLabel: string
+      lateAnswer: (question: string, choice: string) => string
+      lateAnswerTip: string
+      lateAnswerHint: string
     }
     tool: {
       code: string

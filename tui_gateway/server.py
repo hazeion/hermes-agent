@@ -3644,12 +3644,18 @@ def _compress_session_history(
     # cached prompt (which already contains the agent identity block)
     # makes the rebuild append the identity a second time. Mirrors the
     # CLI's _manual_compress fix for issue #15281.
+    # force=True: every caller of this helper is a manual /compress path
+    # (session.compress RPC, slash compress/compact, slash-worker mirror) —
+    # auto-compaction runs inside the agent loop, not here. Manual
+    # compaction bypasses the summary-failure cooldown, matching the CLI
+    # and gateway handlers.
     try:
         compressed, _ = agent._compress_context(
             history,
             None,
             approx_tokens=approx_tokens,
             focus_topic=focus_topic or None,
+            force=True,
             defer_context_engine_notification=True,
         )
     except Exception:
@@ -5767,6 +5773,20 @@ def _append_inflight_delta(session: dict, delta: Any) -> None:
     session["inflight_turn"] = turn
 
 
+def _replace_inflight_user(session: dict, text: Any) -> None:
+    """Reflect an accepted correction as the live turn's current user text."""
+    user = _inflight_text(text)
+    if not user:
+        return
+    turn = session.get("inflight_turn")
+    if not isinstance(turn, dict):
+        return
+    turn = dict(turn)
+    turn["user"] = user
+    turn["updated_at"] = time.time()
+    session["inflight_turn"] = turn
+
+
 def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
@@ -5872,6 +5892,7 @@ def _handle_busy_submit(
         try:
             if agent.redirect(plain_text):
                 with session["history_lock"]:
+                    _replace_inflight_user(session, plain_text)
                     session["last_active"] = time.time()
                 return _ok(rid, {"status": "redirected"})
         except Exception:
@@ -9755,7 +9776,9 @@ def _(rid, params: dict) -> dict:
     except Exception as exc:
         return _err(rid, 5000, f"redirect failed: {exc}")
     if accepted:
-        session["last_active"] = time.time()
+        with session["history_lock"]:
+            _replace_inflight_user(session, text)
+            session["last_active"] = time.time()
     return _ok(
         rid,
         {"status": "redirected" if accepted else "rejected", "text": text},
@@ -10638,6 +10661,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 payload["warning"] = status_note
             if result.get("response_previewed"):
                 payload["response_previewed"] = True
+            # Forward the structured billing-wall descriptor (provider,
+            # billing_url, is_nous, message) so the TUI/desktop render a
+            # billing-specific recovery surface instead of re-parsing text.
+            _billing_block = result.get("billing_block") if isinstance(result, dict) else None
+            if _billing_block:
+                payload["billing"] = _billing_block
+                payload["failure_reason"] = result.get("failure_reason")
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered

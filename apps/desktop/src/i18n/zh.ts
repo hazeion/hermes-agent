@@ -172,6 +172,15 @@ export const zh: Translations = {
     message: reason => `软件渲染已启用 — 检测到远程显示（${reason}）。为防止画面闪烁，已禁用 GPU 加速。`
   },
 
+  billingBlock: {
+    titleNous: 'Nous 额度已用尽',
+    titleProvider: provider => `额度已用尽 — ${provider}`,
+    fallbackMessage: '您的账户额度已用尽。请充值以继续使用。',
+    openBilling: '打开账单',
+    addCredits: '添加额度',
+    dismiss: '忽略'
+  },
+
   titlebar: {
     hideSidebar: '隐藏侧边栏',
     showSidebar: '显示侧边栏',
@@ -274,6 +283,7 @@ export const zh: Translations = {
       'composer.send': '发送消息',
       'composer.newline': '插入换行',
       'composer.steer': '引导正在运行的回合',
+      'composer.queue': '消息排队',
       'composer.sendQueued': '发送下一条排队消息',
       'composer.mention': '引用文件、文件夹、网址',
       'composer.slash': '斜杠命令面板',
@@ -2595,6 +2605,7 @@ export const zh: Translations = {
     closeOthers: '关闭其他',
     closeToRight: '关闭右侧',
     closeAll: '全部关闭',
+    newSessionTab: '新建会话标签',
     split: dir => `向${dir}拆分`,
     move: dir => `向${dir}移动`,
     dirUp: '上',
@@ -2687,7 +2698,10 @@ export const zh: Translations = {
       placeholder: '输入你的答案…',
       skip: '跳过',
       skipped: '已跳过',
-      continueLabel: '继续'
+      continueLabel: '继续',
+      lateAnswer: (question, choice) => `关于"${question}" — 我的回答: ${choice}`,
+      lateAnswerTip: '将此回答起草为后续消息',
+      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。'
     },
     tool: {
       code: '代码',
