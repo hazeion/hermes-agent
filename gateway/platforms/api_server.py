@@ -8,6 +8,7 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/profiles                — lists bounded, safe Hermes profile identities
+- GET  /v1/profile-runtimes        — lists current secret-free provider/model identities
 - GET  /v1/kanban/boards           — bounded revision-aware Kanban board records
 - GET  /v1/kanban/profiles         — bounded Kanban assignee/profile records
 - GET/POST /v1/kanban/tasks        — bounded task listing and idempotent creation
@@ -64,8 +65,9 @@ import sqlite3
 import sys
 import time
 import uuid
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -83,6 +85,82 @@ _RUN_CLARIFY_MAX_QUESTION_CHARS = 2000
 _RUN_CLARIFY_MAX_CHOICE_CHARS = 500
 _RUN_CLARIFY_MAX_RESPONSE_CHARS = 2000
 _RUN_CLARIFY_REQUEST_ID_RE = re.compile(r"^clarify_[0-9a-f]{32}$")
+_RUN_EVENT_CURSOR_RE = re.compile(r"0|[1-9][0-9]{0,9}")
+_RUNTIME_PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}")
+_RUNTIME_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,159}")
+_RUNTIME_SECRET_PREFIX_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:sk-(?:proj-)?|gh[pousr]_|github_pat_|xox[baprs]-|AIza|AKIA|ASIA|eyJ)"
+)
+_RUNTIME_SECRET_SEGMENT_RE = re.compile(
+    r"(?i)(?:^|[./_:@-])(?:api.?key|secret|token|password|passwd|bearer|authorization)(?:$|[./_:@-])"
+)
+_RUN_EVENT_RETENTION = 2048
+_RUN_EVENT_MAX_BYTES = 32 * 1024
+_RUN_EVENT_JOURNAL_MAX_BYTES = 4 * 1024 * 1024
+_RUN_DELTA_TAIL_CHARS = 256
+_RUN_DELTA_MAX_UNBROKEN_CHARS = 16_000
+_RUN_CREDENTIAL_PROBE_CHARS = 128
+_RUN_PUBLIC_PATH_TOKEN_RE = re.compile(r"(?<!\S)\S*[\\/]\S*(?!\S)")
+_RUN_CREDENTIAL_VALUE_RE = re.compile(
+    r"(?i)\b(?:authorization|api[ _-]?key|access[ _-]?token|token|password|passwd|secret)"
+    r"\b[ \t]*[:=][ \t]*(?:bearer[ \t]+)?"
+    r"(?:\"[^\"\r\n]*(?:\"|$)|'[^'\r\n]*(?:'|$)|[^\s,;]+)"
+    r"|\bbearer[ \t]+(?:\"[^\"\r\n]*(?:\"|$)|'[^'\r\n]*(?:'|$)|[^\s,;]+)"
+)
+_RUN_INCOMPLETE_CREDENTIAL_RE = re.compile(
+    r"(?i)(?:\b(?:authorization|api[ _-]?key|access[ _-]?token|token|password|passwd|secret)"
+    r"\b[ \t]*[:=][ \t]*[\"']?(?:bearer[ \t]*)?|\bbearer[ \t]+[\"']?)$"
+)
+_RUN_CREDENTIAL_ASSIGNMENT_STEMS = tuple(
+    f"{label}{delimiter}"
+    for label in (
+        "authorization",
+        "apikey",
+        "accesstoken",
+        "token",
+        "password",
+        "passwd",
+        "secret",
+    )
+    for delimiter in (":", "=")
+)
+_RUN_CREDENTIAL_PROBE_STEMS = _RUN_CREDENTIAL_ASSIGNMENT_STEMS + ("bearer",)
+
+
+def _bounded_public_run_text(value: Any, *, limit: int) -> str:
+    """Redact secret/path-shaped Runs text before status or replay retention."""
+
+    text = _RUN_CREDENTIAL_VALUE_RE.sub(
+        "[credential removed]",
+        str(value or ""),
+    )
+    text = redact_sensitive_text(text, force=True).replace("\x00", "")
+
+    def _redact_path_token(_match: "re.Match[str]") -> str:
+        return "[private reference removed]"
+
+    text = _RUN_PUBLIC_PATH_TOKEN_RE.sub(_redact_path_token, text)
+    return text[:limit]
+
+
+def _safe_runtime_identity(provider: str, model: str, *, allow_empty: bool) -> bool:
+    """Validate only opaque provider/model IDs, never URLs or filesystem paths."""
+    if not provider and not model:
+        return allow_empty
+    if not provider or not model:
+        return False
+    return (
+        _RUNTIME_PROVIDER_RE.fullmatch(provider) is not None
+        and _RUNTIME_MODEL_RE.fullmatch(model) is not None
+        and "://" not in model
+        and not model.startswith(("/", "."))
+        and "\\" not in model
+        and ".." not in model
+        and _RUNTIME_SECRET_PREFIX_RE.search(provider) is None
+        and _RUNTIME_SECRET_PREFIX_RE.search(model) is None
+        and _RUNTIME_SECRET_SEGMENT_RE.search(provider) is None
+        and _RUNTIME_SECRET_SEGMENT_RE.search(model) is None
+    )
 
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
@@ -248,6 +326,7 @@ def _run_session_continuation_revision(
     ).encode("utf-8")
     return f"sessionrev_{hashlib.sha256(canonical).hexdigest()}"
 PROFILE_INVENTORY_VERSION = 1
+PROFILE_RUNTIME_INVENTORY_VERSION = 1
 MAX_PROFILE_INVENTORY_SIZE = 1_000
 PROFILE_INVENTORY_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
@@ -1263,8 +1342,19 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
+        # Active run transports. The compatibility queue remains bounded for
+        # internal callers, while SSE subscribers consume independent queues
+        # fed from the retained event journal below.
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        self._run_event_logs: Dict[str, Deque[Dict[str, Any]]] = {}
+        self._run_event_log_bytes: Dict[str, int] = {}
+        self._run_delta_buffers: Dict[str, str] = {}
+        self._run_redact_until_newline: set[str] = set()
+        self._run_credential_prefixes: Dict[str, str] = {}
+        self._run_event_sequences: Dict[str, int] = {}
+        self._run_subscriber_queues: Dict[
+            str, set["asyncio.Queue[Optional[Dict[str, Any]]]"]
+        ] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
@@ -1283,6 +1373,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Clarify requests use the same per-run isolation rule as approvals,
         # but remain a separate primitive and response endpoint.
         self._run_clarify_sessions: Dict[str, str] = {}
+        # Safe, request-bound recovery state. These maps contain only the same
+        # bounded public previews/prompts emitted through the Runs contract.
+        self._run_pending_approvals: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._run_pending_clarifications: Dict[str, Dict[str, Dict[str, Any]]] = {}
         # Exact Runs continuations are single-writer per resolved session tip.
         # Values are the run IDs that own the in-process claim until their
         # executor-backed work has fully exited.
@@ -1790,6 +1884,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/v1/profiles", self._handle_profiles),
+            ("GET", "/v1/profile-runtimes", self._handle_profile_runtimes),
             ("GET", "/v1/kanban/boards", self._handle_kanban_boards),
             ("GET", "/v1/kanban/profiles", self._handle_kanban_profiles),
             ("GET", "/v1/kanban/tasks", self._handle_kanban_tasks),
@@ -2423,6 +2518,67 @@ class APIServerAdapter(BasePlatformAdapter):
                 for profile_id in profile_ids
             ],
         })
+
+    async def _handle_profile_runtimes(self, request: "web.Request") -> "web.Response":
+        """Return current profile provider/model identifiers without secrets."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    "Profile runtime inventory requires API key authentication",
+                    code="profile_runtime_inventory_auth_required",
+                ),
+                status=403,
+            )
+        try:
+            from hermes_cli.profiles import list_profiles
+
+            raw_profiles = list_profiles()
+            if not raw_profiles or len(raw_profiles) > MAX_PROFILE_INVENTORY_SIZE:
+                raise ValueError("invalid profile runtime inventory size")
+            rows: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for profile in raw_profiles:
+                profile_id = str(getattr(profile, "name", "") or "").strip()
+                provider = str(getattr(profile, "provider", "") or "").strip()
+                model = str(getattr(profile, "model", "") or "").strip()
+                if (
+                    PROFILE_INVENTORY_ID_RE.fullmatch(profile_id) is None
+                    or profile_id in seen
+                    or not _safe_runtime_identity(
+                        provider,
+                        model,
+                        allow_empty=True,
+                    )
+                ):
+                    raise ValueError("unsafe profile runtime identity")
+                seen.add(profile_id)
+                rows.append({
+                    "profile_id": profile_id,
+                    "provider": provider,
+                    "model": model,
+                })
+            if "default" not in seen:
+                raise ValueError("default profile runtime missing")
+        except Exception:
+            logger.exception("GET /v1/profile-runtimes failed")
+            return web.json_response(
+                _openai_error(
+                    "Profile runtime inventory is temporarily unavailable",
+                    err_type="server_error",
+                    code="profile_runtime_inventory_unavailable",
+                ),
+                status=503,
+            )
+        return web.json_response({
+            "object": "hermes.profile_runtime.list",
+            "version": PROFILE_RUNTIME_INVENTORY_VERSION,
+            "complete": True,
+            "data": rows,
+        })
+
     async def _kanban_api_call(self, request: "web.Request", operation, *args, **kwargs) -> "web.Response":
         """Run one bounded Kanban API operation behind the normal bearer gate."""
         auth_err = self._check_auth(request)
@@ -2547,6 +2703,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
+                "run_event_replay": True,
+                "run_event_replay_version": 1,
+                "run_pending_action_status": True,
+                "run_pending_action_status_version": 1,
+                "run_runtime_identity": True,
+                "run_runtime_identity_version": 1,
                 "run_stop": True,
                 "run_inline_images": True,
                 "run_inline_images_version": 1,
@@ -2579,6 +2741,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "profile_inventory_version": PROFILE_INVENTORY_VERSION,
                 "profile_inventory_complete": True,
                 "profile_inventory_requires_api_key": True,
+                "profile_runtime_inventory": bool(self._api_key),
+                "profile_runtime_inventory_version": PROFILE_RUNTIME_INVENTORY_VERSION,
+                "profile_runtime_inventory_complete": True,
+                "profile_runtime_inventory_requires_api_key": True,
                 "kanban_api": bool(self._api_key),
                 "kanban_api_version": 1,
                 "kanban_api_revisioned": True,
@@ -2595,6 +2761,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "profiles": {"method": "GET", "path": "/v1/profiles"},
+                "profile_runtimes": {
+                    "method": "GET",
+                    "path": "/v1/profile-runtimes",
+                },
                 "kanban_boards": {"method": "GET", "path": "/v1/kanban/boards"},
                 "kanban_profiles": {"method": "GET", "path": "/v1/kanban/profiles?board={board}"},
                 "kanban_tasks": {"method": "GET", "path": "/v1/kanban/tasks?board={board}"},
@@ -5424,10 +5594,438 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
+    def _emit_safe_run_delta_chunks(
+        self,
+        run_id: str,
+        text: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Publish boundary-complete text chunks after cross-delta buffering."""
+
+        last: Optional[Dict[str, Any]] = None
+        remaining = text
+        while remaining:
+            if len(remaining) <= 15_000:
+                chunk = remaining
+                remaining = ""
+            else:
+                boundary = max(
+                    remaining.rfind(character, 0, 15_001)
+                    for character in (" ", "\t", "\r", "\n")
+                )
+                if boundary < 0:
+                    chunk = "[redacted unbroken stream segment]"
+                    remaining = ""
+                else:
+                    chunk = remaining[:boundary + 1]
+                    remaining = remaining[boundary + 1:]
+            last = self._publish_run_event(
+                run_id,
+                {
+                    "event": "message.safe_delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": chunk,
+                },
+            )
+        return last
+
+    @staticmethod
+    def _normalized_credential_probe(value: str) -> str:
+        """Collapse padding that must not consume the lexical probe budget."""
+
+        return re.sub(r"[ \t_\"'-]+", "", value.lower())
+
+    @classmethod
+    def _credential_probe_state(cls, value: str) -> str:
+        """Classify a bounded same-line suffix as a credential marker probe."""
+
+        normalized = cls._normalized_credential_probe(value)
+        if not normalized:
+            return "none"
+        if any(
+            normalized.startswith(stem)
+            for stem in _RUN_CREDENTIAL_ASSIGNMENT_STEMS
+        ) or normalized.startswith("bearer"):
+            return "complete"
+        if any(
+            stem.startswith(normalized)
+            for stem in _RUN_CREDENTIAL_PROBE_STEMS
+        ):
+            return "partial"
+        return "none"
+
+    @classmethod
+    def _credential_probe_suffix(cls, value: str) -> tuple[str, str]:
+        """Return the longest word-boundary suffix that may be a marker."""
+
+        line = re.split(r"[\r\n]", value)[-1]
+        if _RUN_CREDENTIAL_VALUE_RE.search(line):
+            return "authorization:", "complete"
+        normalized = cls._normalized_credential_probe(line)
+        max_width = min(
+            len(normalized),
+            max(len(stem) for stem in _RUN_CREDENTIAL_PROBE_STEMS),
+        )
+        for width in range(max_width, 0, -1):
+            candidate = normalized[-width:]
+            state = cls._credential_probe_state(candidate)
+            if state != "none":
+                return candidate, state
+        return "", "none"
+
+    def _apply_run_credential_continuation(
+        self,
+        run_id: str,
+        incoming: str,
+    ) -> str:
+        """Carry partial credential markers safely across lifecycle events."""
+
+        if run_id in self._run_redact_until_newline:
+            newline = next(
+                (
+                    index
+                    for index, character in enumerate(incoming)
+                    if character in "\r\n"
+                ),
+                None,
+            )
+            if newline is None:
+                return ""
+            self._run_redact_until_newline.discard(run_id)
+            return incoming[newline:]
+
+        prefix = self._run_credential_prefixes.pop(run_id, "")
+        if not prefix:
+            return incoming
+        newline = next(
+            (
+                index
+                for index, character in enumerate(incoming)
+                if character in "\r\n"
+            ),
+            None,
+        )
+        same_line = incoming if newline is None else incoming[:newline]
+        combined = prefix + same_line
+        state = self._credential_probe_state(combined)
+        if state == "partial" and newline is None:
+            self._run_credential_prefixes[run_id] = (
+                self._normalized_credential_probe(combined)[
+                    -_RUN_CREDENTIAL_PROBE_CHARS:
+                ]
+            )
+            return incoming
+        if state != "complete":
+            return incoming
+        if (
+            newline is not None
+            and not self._normalized_credential_probe(same_line)
+        ):
+            return incoming
+
+        if newline is None:
+            self._run_redact_until_newline.add(run_id)
+            return "[credential removed]"
+        return "[credential removed]" + incoming[newline:]
+
+    def _remember_run_credential_probe(self, run_id: str, value: str) -> None:
+        """Carry normalized marker state across any public emission boundary."""
+
+        probe, probe_state = self._credential_probe_suffix(value)
+        if probe_state == "partial":
+            self._run_credential_prefixes[run_id] = probe
+        elif probe_state == "complete":
+            self._run_redact_until_newline.add(run_id)
+
+    def _prepare_run_delta_emission(self, run_id: str, value: str) -> str:
+        """Advance stream-redaction state exactly once for emitted text."""
+
+        had_state = (
+            run_id in self._run_redact_until_newline
+            or run_id in self._run_credential_prefixes
+        )
+        safe = self._apply_run_credential_continuation(run_id, value)
+        if (
+            not had_state
+            or (
+                run_id not in self._run_redact_until_newline
+                and run_id not in self._run_credential_prefixes
+            )
+        ):
+            self._remember_run_credential_probe(run_id, value)
+        return safe
+
+    def _buffer_run_delta(
+        self,
+        run_id: str,
+        delta: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Withhold a token tail so secrets split across deltas cannot escape."""
+
+        if isinstance(delta, str):
+            incoming = delta
+        else:
+            incoming = str(delta or "")
+        if len(incoming) > _RUN_DELTA_MAX_UNBROKEN_CHARS:
+            incoming = "[redacted oversized stream segment]"
+        buffer = self._run_delta_buffers.get(run_id, "") + incoming
+        emit_until = len(buffer) - _RUN_DELTA_TAIL_CHARS
+        if emit_until <= 0:
+            self._run_delta_buffers[run_id] = buffer
+            return None
+        boundary = max(
+            buffer.rfind(character, 0, emit_until + 1)
+            for character in (" ", "\t", "\r", "\n")
+        )
+        if boundary < 0:
+            if len(buffer) > _RUN_DELTA_MAX_UNBROKEN_CHARS:
+                self._run_delta_buffers[run_id] = ""
+                return self._emit_safe_run_delta_chunks(
+                    run_id,
+                    "[redacted unbroken stream segment]",
+                )
+            self._run_delta_buffers[run_id] = buffer
+            return None
+        ready = buffer[:boundary + 1]
+        incomplete = _RUN_INCOMPLETE_CREDENTIAL_RE.search(ready)
+        if incomplete is not None:
+            if len(buffer) > _RUN_DELTA_MAX_UNBROKEN_CHARS:
+                self._run_delta_buffers[run_id] = ""
+                self._run_redact_until_newline.add(run_id)
+                return self._emit_safe_run_delta_chunks(
+                    run_id,
+                    ready[:incomplete.start()] + "[credential removed]",
+                )
+            self._run_delta_buffers[run_id] = buffer
+            return None
+        self._run_delta_buffers[run_id] = buffer[boundary + 1:]
+        ready = self._prepare_run_delta_emission(run_id, ready)
+        return self._emit_safe_run_delta_chunks(run_id, ready)
+
+    def _flush_run_delta(self, run_id: str) -> Optional[Dict[str, Any]]:
+        remaining = self._run_delta_buffers.pop(run_id, "")
+        remaining = self._prepare_run_delta_emission(run_id, remaining)
+        if not remaining:
+            return None
+        incomplete = _RUN_INCOMPLETE_CREDENTIAL_RE.search(remaining)
+        if incomplete is not None:
+            remaining = (
+                remaining[:incomplete.start()]
+                + "[credential removed]"
+            )
+            self._run_redact_until_newline.add(run_id)
+        if (
+            len(remaining) > _RUN_DELTA_MAX_UNBROKEN_CHARS
+            and not any(character.isspace() for character in remaining)
+        ):
+            remaining = "[redacted unbroken stream segment]"
+        return self._emit_safe_run_delta_chunks(run_id, remaining)
+
+    @staticmethod
+    def _normalize_public_run_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return the only schema eligible for Runs replay and SSE egress."""
+
+        event_type = event.get("event")
+        run_id = event.get("run_id")
+        if (
+            not isinstance(event_type, str)
+            or not isinstance(run_id, str)
+            or not run_id
+            or len(run_id) > 128
+        ):
+            return None
+        raw_timestamp = event.get("timestamp")
+        if raw_timestamp is not None and not isinstance(raw_timestamp, (int, float)):
+            return None
+        published: Dict[str, Any] = {
+            "event": event_type,
+            "run_id": run_id,
+            "timestamp": float(raw_timestamp or time.time()),
+        }
+        if event_type == "message.safe_delta":
+            published["event"] = "message.delta"
+            published["delta"] = _bounded_public_run_text(
+                event.get("delta"), limit=16_000
+            )
+        elif event_type in {"tool.started", "tool.completed"}:
+            tool = event.get("tool")
+            if (
+                not isinstance(tool, str)
+                or re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", tool) is None
+            ):
+                return None
+            published["tool"] = tool
+        elif event_type == "reasoning.available":
+            pass
+        elif event_type == "approval.request":
+            request_id = event.get("request_id")
+            preview = event.get("preview")
+            choices = event.get("choices")
+            if (
+                not isinstance(request_id, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", request_id)
+                is None
+                or type(preview) is not dict
+                or preview.get("version") != 1
+                or preview.get("category") not in _APPROVAL_PREVIEW_COPY
+                or not isinstance(preview.get("risk_labels"), list)
+                or not isinstance(choices, list)
+            ):
+                return None
+            title, summary = _APPROVAL_PREVIEW_COPY[preview["category"]]
+            safe_choices = [
+                choice
+                for choice in ("once", "session", "always", "deny")
+                if choice in choices
+            ]
+            if not {"once", "deny"}.issubset(set(safe_choices)):
+                return None
+            published.update({
+                "request_id": request_id,
+                "preview": {
+                    "version": 1,
+                    "category": preview["category"],
+                    "title": title,
+                    "summary": summary,
+                    "risk_labels": [
+                        _bounded_public_run_text(label, limit=120)
+                        for label in preview["risk_labels"][:8]
+                        if isinstance(label, str) and label
+                    ],
+                },
+                "choices": safe_choices,
+            })
+        elif event_type == "clarify.request":
+            request_id = event.get("request_id")
+            prompt = event.get("prompt")
+            if (
+                not isinstance(request_id, str)
+                or _RUN_CLARIFY_REQUEST_ID_RE.fullmatch(request_id) is None
+                or type(prompt) is not dict
+                or prompt.get("version") != 1
+                or prompt.get("type") not in {"choice", "text"}
+            ):
+                return None
+            safe_prompt: Dict[str, Any] = {
+                "version": 1,
+                "type": prompt["type"],
+                "question": _bounded_public_run_text(
+                    prompt.get("question"), limit=_RUN_CLARIFY_MAX_QUESTION_CHARS
+                ),
+            }
+            if not safe_prompt["question"].strip():
+                return None
+            if prompt["type"] == "choice":
+                choices = prompt.get("choices")
+                if not isinstance(choices, list) or not (1 <= len(choices) <= 4):
+                    return None
+                safe_prompt["choices"] = []
+                for choice in choices:
+                    if (
+                        type(choice) is not dict
+                        or re.fullmatch(r"choice-[1-4]", str(choice.get("id") or ""))
+                        is None
+                    ):
+                        return None
+                    label = _bounded_public_run_text(
+                        choice.get("label"), limit=_RUN_CLARIFY_MAX_CHOICE_CHARS
+                    )
+                    if not label.strip():
+                        return None
+                    safe_prompt["choices"].append({
+                        "id": choice["id"],
+                        "label": label,
+                    })
+            published.update({"request_id": request_id, "prompt": safe_prompt})
+        elif event_type == "approval.responded":
+            request_id = event.get("request_id")
+            if (
+                (
+                    request_id is not None
+                    and (
+                        not isinstance(request_id, str)
+                        or re.fullmatch(
+                            r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}",
+                            request_id,
+                        )
+                        is None
+                    )
+                )
+                or event.get("choice") not in {"once", "session", "always", "deny"}
+                or type(event.get("resolved")) is not int
+                or event["resolved"] < 1
+            ):
+                return None
+            if request_id is not None:
+                published["request_id"] = request_id
+            published.update({
+                "choice": event["choice"],
+                "resolved": event["resolved"],
+            })
+        elif event_type == "clarify.responded":
+            request_id = event.get("request_id")
+            response_type = event.get("type")
+            if (
+                not isinstance(request_id, str)
+                or _RUN_CLARIFY_REQUEST_ID_RE.fullmatch(request_id) is None
+                or response_type not in {"choice", "text"}
+            ):
+                return None
+            published.update({"request_id": request_id, "type": response_type})
+            if response_type == "choice":
+                choice_id = event.get("choice_id")
+                if re.fullmatch(r"choice-[1-4]", str(choice_id or "")) is None:
+                    return None
+                published["choice_id"] = choice_id
+        elif event_type == "runtime.updated":
+            provider = str(event.get("provider") or "")
+            model = str(event.get("model") or "")
+            if not _safe_runtime_identity(provider, model, allow_empty=False):
+                return None
+            published.update({"provider": provider, "model": model})
+        elif event_type == "run.cancelled":
+            pass
+        elif event_type == "run.failed":
+            raw_error = str(event.get("error") or "")
+            published.update({
+                "error": _bounded_public_run_text(raw_error, limit=2_000),
+                "error_complete": len(raw_error) <= 2_000,
+            })
+        elif event_type == "run.completed":
+            raw_output = str(event.get("output") or "")
+            published.update({
+                "output": _bounded_public_run_text(raw_output, limit=16_000),
+                "output_complete": len(raw_output) <= 16_000,
+                "output_chars": min(len(raw_output), 200_000),
+            })
+            usage = event.get("usage")
+            if type(usage) is dict:
+                safe_usage: Dict[str, int] = {}
+                for key in ("input_tokens", "output_tokens", "total_tokens"):
+                    value = usage.get(key)
+                    if type(value) is not int or not (0 <= value <= 10**9):
+                        return None
+                    safe_usage[key] = value
+                published["usage"] = safe_usage
+        else:
+            return None
+        encoded = json.dumps(
+            published, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return published if len(encoded) <= _RUN_EVENT_MAX_BYTES else None
+
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
         current = self._run_statuses.get(run_id, {})
+        if "output" in fields:
+            fields["output"] = _bounded_public_run_text(
+                fields["output"], limit=200_000
+            )
+        if "error" in fields:
+            fields["error"] = _bounded_public_run_text(
+                fields["error"], limit=2_000
+            )
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -5435,35 +6033,230 @@ class APIServerAdapter(BasePlatformAdapter):
             "updated_at": now,
         })
         current.setdefault("created_at", fields.pop("created_at", now))
+        if fields.get("pending_action", object()) is None:
+            current.pop("pending_action", None)
+            fields.pop("pending_action", None)
         current.update(fields)
         self._run_statuses[run_id] = current
         return current
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+    def _publish_run_event(self, run_id: str, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Sequence, retain, and broadcast one bounded public Runs event."""
+        if run_id not in self._run_streams:
+            return None
+        event_type = event.get("event")
+        if event_type == "message.delta":
+            return self._buffer_run_delta(run_id, event.get("delta"))
+        if event_type != "message.safe_delta":
+            self._flush_run_delta(run_id)
+        normalized = self._normalize_public_run_event(event)
+        if normalized is None:
+            logger.warning(
+                "[api_server] dropped invalid public run event %r for %s",
+                event.get("event"),
+                run_id,
+            )
+            return None
+        sequence = self._run_event_sequences.get(run_id, 0) + 1
+        self._run_event_sequences[run_id] = sequence
+        published = dict(normalized)
+        published["sequence"] = sequence
+        published["event_id"] = sequence
+        log = self._run_event_logs.setdefault(
+            run_id, deque(maxlen=_RUN_EVENT_RETENTION)
+        )
+        event_bytes = len(json.dumps(
+            published, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8"))
+        retained_bytes = self._run_event_log_bytes.get(run_id, 0)
+        while log and (
+            len(log) >= _RUN_EVENT_RETENTION
+            or retained_bytes + event_bytes > _RUN_EVENT_JOURNAL_MAX_BYTES
+        ):
+            removed = log.popleft()
+            retained_bytes -= len(json.dumps(
+                removed, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8"))
+        log.append(published)
+        self._run_event_log_bytes[run_id] = max(0, retained_bytes) + event_bytes
+
+        compatibility_queue = self._run_streams.get(run_id)
+        if compatibility_queue is not None:
+            try:
+                if compatibility_queue.full():
+                    compatibility_queue.get_nowait()
+                compatibility_queue.put_nowait(published)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+        for subscriber in tuple(self._run_subscriber_queues.get(run_id, ())):
+            try:
+                subscriber.put_nowait(published)
+            except asyncio.QueueFull:
+                # A subscriber that cannot keep up must reconnect with its last
+                # verified cursor; never discard journal ordering globally.
+                self._force_queue_sentinel(subscriber)
+                self._run_subscriber_queues.get(run_id, set()).discard(subscriber)
+        return published
+
+    @staticmethod
+    def _force_queue_sentinel(stream: "asyncio.Queue[Optional[Dict[str, Any]]]") -> None:
+        """Wake one stream even when its private bounded queue is saturated."""
+        while True:
+            try:
+                stream.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        stream.put_nowait(None)
+
+    @staticmethod
+    def _enqueue_queue_sentinel(stream: "asyncio.Queue[Optional[Dict[str, Any]]]") -> None:
+        """Close after queued events without creating a sequence gap."""
+        if stream.full():
+            # A terminal event already closes SSE readers. If a non-terminal
+            # subscriber is saturated, publish forced it onto the clean
+            # reconnect path instead of leaving a gapped suffix.
+            return
+        stream.put_nowait(None)
+
+    def _close_run_event_stream(self, run_id: str) -> None:
+        compatibility_queue = self._run_streams.get(run_id)
+        if compatibility_queue is not None:
+            self._enqueue_queue_sentinel(compatibility_queue)
+        for subscriber in tuple(self._run_subscriber_queues.get(run_id, ())):
+            self._enqueue_queue_sentinel(subscriber)
+
+    @staticmethod
+    def _runtime_identity(agent: Any) -> Optional[Dict[str, str]]:
+        provider = str(getattr(agent, "provider", "") or "").strip()
+        model = str(getattr(agent, "model", "") or "").strip()
+        if not _safe_runtime_identity(provider, model, allow_empty=False):
+            return None
+        return {"provider": provider, "model": model}
+
+    def _publish_runtime_if_changed(
+        self,
+        run_id: str,
+        agent: Any,
+        runtime_ref: Dict[str, Any],
+    ) -> None:
+        runtime = self._runtime_identity(agent)
+        if runtime is None or runtime == runtime_ref.get("last"):
+            return
+        runtime_ref["last"] = dict(runtime)
+        self._set_run_status(
+            run_id,
+            self._run_statuses.get(run_id, {}).get("status", "running"),
+            runtime=dict(runtime),
+            last_event="runtime.updated",
+        )
+        self._publish_run_event(
+            run_id,
+            {
+                "event": "runtime.updated",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                **runtime,
+            },
+        )
+
+    def _current_pending_action(self, run_id: str) -> Optional[Dict[str, Any]]:
+        approvals = self._run_pending_approvals.get(run_id) or {}
+        if approvals:
+            return dict(next(iter(approvals.values())))
+        clarifications = self._run_pending_clarifications.get(run_id) or {}
+        if clarifications:
+            return dict(next(iter(clarifications.values())))
+        return None
+
+    def _register_run_approval_event(
+        self,
+        run_id: str,
+        approval_session_key: str,
+        source: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Mirror only an exact approval that remains pending in the core."""
+
+        source = dict(source or {})
+        request_id = str(source.get("request_id") or "")
+        from tools.approval import is_gateway_approval_pending
+
+        if (
+            run_id in self._stopping_run_ids
+            or not is_gateway_approval_pending(
+                approval_session_key,
+                request_id,
+            )
+        ):
+            return None
+        choices = _approval_event_choices(
+            smart_denied=bool(source.get("smart_denied")),
+            allow_permanent=source.get("allow_permanent") is not False,
+        )
+        event = {
+            "event": "approval.request",
+            "run_id": run_id,
+            "request_id": request_id,
+            "timestamp": time.time(),
+            "preview": _safe_approval_preview(source),
+            "choices": choices,
+        }
+        action = {
+            "version": 1,
+            "kind": "approval",
+            "request_id": request_id,
+            "preview": dict(event["preview"]),
+            "choices": list(choices),
+        }
+        self._run_pending_approvals.setdefault(
+            run_id, {}
+        )[request_id] = action
+        self._set_run_status(
+            run_id,
+            "waiting_for_approval",
+            last_event="approval.request",
+            pending_action=dict(action),
+        )
+        return self._publish_run_event(run_id, event)
+
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        runtime_ref: Optional[Dict[str, Any]] = None,
+    ):
+        """Return a tool callback that publishes retained structured events."""
+        runtime_ref = runtime_ref if runtime_ref is not None else {}
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
                 self._run_statuses.get(run_id, {}).get("status", "running"),
                 last_event=event.get("event"),
             )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                loop.call_soon_threadsafe(self._publish_run_event, run_id, event)
             except Exception:
                 pass
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
+            agent = runtime_ref.get("agent")
+            if agent is not None:
+                try:
+                    loop.call_soon_threadsafe(
+                        self._publish_runtime_if_changed,
+                        run_id,
+                        agent,
+                        runtime_ref,
+                    )
+                except Exception:
+                    pass
             if event_type == "tool.started":
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
-                    "preview": preview,
                 })
             elif event_type == "tool.completed":
                 _push({
@@ -5479,7 +6272,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     "event": "reasoning.available",
                     "run_id": run_id,
                     "timestamp": ts,
-                    "text": preview or "",
                 })
             # _thinking and subagent_progress are intentionally not forwarded
 
@@ -5771,19 +6563,34 @@ class APIServerAdapter(BasePlatformAdapter):
         clarify_session_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue(
+            maxsize=_RUN_EVENT_RETENTION
+        )
         created_at = time.time()
         self._run_streams[run_id] = q
+        self._run_event_logs[run_id] = deque(maxlen=_RUN_EVENT_RETENTION)
+        self._run_event_log_bytes[run_id] = 0
+        self._run_delta_buffers[run_id] = ""
+        self._run_redact_until_newline.discard(run_id)
+        self._run_credential_prefixes.pop(run_id, None)
+        self._run_event_sequences[run_id] = 0
+        self._run_subscriber_queues[run_id] = set()
+        self._run_pending_approvals[run_id] = {}
+        self._run_pending_clarifications[run_id] = {}
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
         self._run_clarify_sessions[run_id] = clarify_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        runtime_ref: Dict[str, Any] = {"agent": None, "last": None}
+        event_cb = self._make_run_event_callback(run_id, loop, runtime_ref)
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
             if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+                if event is None:
+                    self._close_run_event_stream(run_id)
+                else:
+                    self._publish_run_event(run_id, event)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -5838,15 +6645,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 def _clarify_callback(question: str, choices) -> str:
                     from tools import clarify_gateway
 
-                    safe_question = str(
-                        redact_sensitive_text(str(question or ""), force=True) or ""
-                    )[:_RUN_CLARIFY_MAX_QUESTION_CHARS]
+                    safe_question = _bounded_public_run_text(
+                        question, limit=_RUN_CLARIFY_MAX_QUESTION_CHARS
+                    )
                     safe_choices = None
                     if choices:
                         safe_choices = [
-                            str(redact_sensitive_text(str(choice), force=True) or "")[
-                                :_RUN_CLARIFY_MAX_CHOICE_CHARS
-                            ]
+                            _bounded_public_run_text(
+                                choice, limit=_RUN_CLARIFY_MAX_CHOICE_CHARS
+                            )
                             for choice in list(choices)[:4]
                         ]
                     request_id = f"clarify_{uuid.uuid4().hex}"
@@ -5880,10 +6687,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         if self._run_streams.get(run_id) is not q:
                             clarify_gateway.clear_session(clarify_session_key)
                             return
+                        action = {
+                            "version": 1,
+                            "kind": "clarification",
+                            "request_id": request_id,
+                            "prompt": dict(prompt),
+                        }
+                        self._run_pending_clarifications.setdefault(
+                            run_id, {}
+                        )[request_id] = action
                         self._set_run_status(
                             run_id,
                             "waiting_for_clarification",
                             last_event="clarify.request",
+                            pending_action=dict(action),
                         )
                         _put_event_if_active({
                             "event": "clarify.request",
@@ -5918,36 +6735,25 @@ class APIServerAdapter(BasePlatformAdapter):
                         clarify_callback=_clarify_callback,
                         enable_clarify=True,
                     )
+                runtime_ref["agent"] = agent
                 self._active_run_agents[run_id] = agent
+                self._publish_runtime_if_changed(run_id, agent, runtime_ref)
+
+                def _register_approval_event(source: Dict[str, Any]) -> None:
+                    self._register_run_approval_event(
+                        run_id,
+                        approval_session_key,
+                        source,
+                    )
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    event["preview"] = _safe_approval_preview(event)
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
-
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
-                    )
+                    source = dict(approval_data or {})
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception:
+                        loop.call_soon_threadsafe(
+                            _register_approval_event,
+                            source,
+                        )
+                    except RuntimeError:
                         pass
 
                 def _run_sync():
@@ -5999,6 +6805,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                self._publish_runtime_if_changed(run_id, agent, runtime_ref)
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -6009,6 +6816,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
+                        pending_action=None,
                     )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
@@ -6026,6 +6834,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "failed",
                         error=error_msg,
                         last_event="run.failed",
+                        pending_action=None,
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -6042,12 +6851,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         output=final_response,
                         usage=usage,
                         last_event="run.completed",
+                        pending_action=None,
                     )
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
                     "cancelled",
                     last_event="run.cancelled",
+                    pending_action=None,
                 )
                 try:
                     _put_event_if_active({
@@ -6065,6 +6876,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "failed",
                     error=_redact_api_error_text(exc),
                     last_event="run.failed",
+                    pending_action=None,
                 )
                 try:
                     _put_event_if_active({
@@ -6102,6 +6914,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
                 self._run_clarify_sessions.pop(run_id, None)
+                self._run_pending_approvals.pop(run_id, None)
+                self._run_pending_clarifications.pop(run_id, None)
                 if (
                     continued_session_id is not None
                     and self._active_continuation_sessions.get(
@@ -6150,7 +6964,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+        """Replay retained events, then follow an independent live SSE stream."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -6165,8 +6979,56 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
+        raw_cursor = str(request.headers.get("Last-Event-ID") or "").strip()
+        cursor_supplied = bool(raw_cursor)
+        if cursor_supplied and _RUN_EVENT_CURSOR_RE.fullmatch(raw_cursor) is None:
+            return web.json_response(
+                _openai_error(
+                    "Invalid run event cursor",
+                    code="run_event_cursor_invalid",
+                ),
+                status=400,
+            )
+        cursor = int(raw_cursor or 0)
+        log = self._run_event_logs.get(run_id)
+        if log is None:
+            return web.json_response(
+                _openai_error(
+                    "Run event replay is unavailable",
+                    code="run_event_replay_unavailable",
+                ),
+                status=409,
+            )
+        latest = self._run_event_sequences.get(run_id, 0)
+        oldest = int(log[0]["sequence"]) if log else latest + 1
+        if cursor > latest:
+            return web.json_response(
+                _openai_error(
+                    "Run event cursor is ahead of the current stream",
+                    code="run_event_cursor_invalid",
+                ),
+                status=409,
+            )
+        if cursor_supplied and log and cursor < oldest - 1:
+            return web.json_response(
+                _openai_error(
+                    "Run event cursor is no longer retained",
+                    code="run_event_cursor_expired",
+                ),
+                status=409,
+            )
+
+        subscriber: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue(
+            maxsize=_RUN_EVENT_RETENTION
+        )
+        subscribers = self._run_subscriber_queues.setdefault(run_id, set())
+        subscribers.add(subscriber)
         self._run_stream_subscribers.add(run_id)
+        replay = [
+            dict(event)
+            for event in log
+            if int(event.get("sequence", 0)) > cursor
+        ]
 
         response = web.StreamResponse(
             status=200,
@@ -6178,25 +7040,51 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         await response.prepare(request)
 
+        last_sent = cursor
+        terminal_events = {"run.completed", "run.failed", "run.cancelled"}
+
+        async def _write_event(event: Dict[str, Any]) -> bool:
+            nonlocal last_sent
+            sequence = int(event.get("sequence", 0))
+            if sequence <= last_sent:
+                return False
+            payload = json.dumps(event, separators=(",", ":"), ensure_ascii=False)
+            await response.write(
+                f"id: {sequence}\ndata: {payload}\n\n".encode("utf-8")
+            )
+            last_sent = sequence
+            return event.get("event") in terminal_events
+
         try:
+            for event in replay:
+                if await _write_event(event):
+                    await response.write(b": stream closed\n\n")
+                    return response
+            status = self._run_statuses.get(run_id, {}).get("status")
+            if (
+                status in {"completed", "failed", "cancelled"}
+                and subscriber.empty()
+            ):
+                await response.write(b": stream closed\n\n")
+                return response
             while True:
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    event = await asyncio.wait_for(subscriber.get(), timeout=30.0)
                 except asyncio.TimeoutError:
                     await response.write(b": keepalive\n\n")
                     continue
                 if event is None:
-                    # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
-                payload = f"data: {json.dumps(event)}\n\n"
-                await response.write(payload.encode())
+                if await _write_event(event):
+                    await response.write(b": stream closed\n\n")
+                    break
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
-            self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            subscribers.discard(subscriber)
+            if not subscribers:
+                self._run_stream_subscribers.discard(run_id)
 
         return response
 
@@ -6301,23 +7189,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        next_status = "waiting_for_approval" if still_pending else "running"
-        self._set_run_status(run_id, next_status, last_event="approval.responded")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            try:
-                responded_event = {
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                }
-                if request_id is not None:
-                    responded_event["request_id"] = request_id
-                q.put_nowait(responded_event)
-            except Exception:
-                pass
+        pending_approvals = self._run_pending_approvals.setdefault(run_id, {})
+        if request_id is not None:
+            pending_approvals.pop(request_id, None)
+        else:
+            for pending_id in list(pending_approvals)[:resolved]:
+                pending_approvals.pop(pending_id, None)
+        pending_action = self._current_pending_action(run_id)
+        next_status = (
+            "waiting_for_approval"
+            if pending_action or still_pending
+            else "running"
+        )
+        self._set_run_status(
+            run_id,
+            next_status,
+            last_event="approval.responded",
+            pending_action=pending_action,
+        )
+        responded_event = {
+            "event": "approval.responded",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "choice": choice,
+            "resolved": resolved,
+        }
+        if request_id is not None:
+            responded_event["request_id"] = request_id
+        self._publish_run_event(run_id, responded_event)
 
         response_data = {
             "object": "hermes.run.approval_response",
@@ -6452,8 +7351,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="clarify.responded")
-        q = self._run_streams.get(run_id)
+        self._run_pending_clarifications.setdefault(run_id, {}).pop(
+            request_id, None
+        )
+        self._set_run_status(
+            run_id,
+            "running",
+            last_event="clarify.responded",
+            pending_action=self._current_pending_action(run_id),
+        )
         event = {
             "event": "clarify.responded",
             "run_id": run_id,
@@ -6461,11 +7367,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "timestamp": time.time(),
             **response_summary,
         }
-        if q is not None:
-            try:
-                q.put_nowait(event)
-            except Exception:
-                pass
+        self._publish_run_event(run_id, event)
         return web.json_response({
             "object": "hermes.run.clarification_response",
             "run_id": run_id,
@@ -6486,7 +7388,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+        self._set_run_status(
+            run_id,
+            "stopping",
+            last_event="run.stopping",
+            pending_action=None,
+        )
         self._stopping_run_ids.add(run_id)
 
         if agent is not None:
@@ -6521,6 +7428,10 @@ class APIServerAdapter(BasePlatformAdapter):
             for run_id, created_at in list(self._run_streams_created.items())
             if now - created_at > self._RUN_STREAM_TTL
             and run_id not in self._run_stream_subscribers
+            and (
+                self._active_run_tasks.get(run_id) is None
+                or self._active_run_tasks[run_id].done()
+            )
         ]
         for run_id in stale:
             logger.debug("[api_server] sweeping expired run transport %s", run_id)
@@ -6539,6 +7450,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # independent and survives until the executor-backed task returns.
             self._run_streams.pop(run_id, None)
             self._run_streams_created.pop(run_id, None)
+            self._run_event_logs.pop(run_id, None)
+            self._run_event_log_bytes.pop(run_id, None)
+            self._run_delta_buffers.pop(run_id, None)
+            self._run_redact_until_newline.discard(run_id)
+            self._run_credential_prefixes.pop(run_id, None)
+            self._run_event_sequences.pop(run_id, None)
+            self._run_subscriber_queues.pop(run_id, None)
+            self._run_pending_approvals.pop(run_id, None)
+            self._run_pending_clarifications.pop(run_id, None)
             if task_done:
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)

@@ -91,7 +91,7 @@ POST /v1/responses               OpenAI Responses API (stateful)
 POST /v1/runs                    Start a run, returns run_id (202)
 GET  /v1/sessions/{id}/continuation Issue an exact Runs continuation descriptor
 GET  /v1/runs/{id}               Run status
-GET  /v1/runs/{id}/events        SSE stream of lifecycle events
+GET  /v1/runs/{id}/events        Replayable SSE lifecycle stream
 POST /v1/runs/{id}/approval      Resolve an exact pending approval by request_id
 POST /v1/runs/{id}/clarification Answer an exact pending clarification
 POST /v1/runs/{id}/stop          Interrupt the run
@@ -100,6 +100,7 @@ GET/POST /v1/kanban/tasks        Revision-aware Kanban task records/actions
 GET  /v1/capabilities            Machine-readable feature flags
 GET  /v1/models                  Lists hermes-agent
 GET  /v1/profiles                Complete, API-key-authenticated profile IDs
+GET  /v1/profile-runtimes        Read-only current provider/model IDs
 GET  /health, /health/detailed
 ```
 
@@ -110,6 +111,21 @@ preview. Capability-aware clients should display only that preview and return
 the same ID with their decision; stale IDs fail closed instead of resolving the
 next queued request. The no-ID FIFO response remains available only for legacy
 clients.
+
+Runs SSE events carry monotonic IDs. Keep the stream open while an approval or
+clarification is pending; after a real interruption, reconnect with the last
+verified `Last-Event-ID`. Capability-aware clients may recover the exact
+current pending action from run status. Runtime identity events and the profile
+runtime inventory are read-only and contain only bounded provider/model IDs.
+The replay journal is count- and byte-bounded and retains only normalized
+public event fields; it omits raw tool previews, commands, and reasoning bodies.
+Delta redaction spans chunk boundaries. Treat terminal SSE output/error as a
+bounded preview and use run status as the authoritative terminal result.
+Credential assignment matching permits horizontal spaces and tabs across
+chunks but treats CR/LF as the end of that assignment.
+Buffered text is sequenced before any later lifecycle event. If a legacy
+controller produces an unbound approval acknowledgement, reconcile run status
+before changing an exact request-bound UI.
 
 ---
 

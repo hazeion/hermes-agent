@@ -228,6 +228,31 @@ descriptions, aliases, provider/model settings, distribution metadata, skill
 counts, environment state, or credentials. It fails instead of returning a
 partial or malformed inventory.
 
+### GET /v1/profile-runtimes
+
+Returns a complete, read-only runtime identity snapshot for the profile roster.
+A configured `API_SERVER_KEY` is always required.
+
+```json
+{
+  "object": "hermes.profile_runtime.list",
+  "version": 1,
+  "complete": true,
+  "data": [
+    {
+      "profile_id": "default",
+      "provider": "openrouter",
+      "model": "anthropic/claude-sonnet-4"
+    }
+  ]
+}
+```
+
+Only bounded opaque provider/model IDs are returned. URLs, paths,
+credential-shaped identifiers, environment names, authentication metadata,
+and partial snapshots fail closed. This endpoint grants read visibility only;
+it is not a provider-switching API.
+
 ### GET /v1/capabilities
 
 Returns a machine-readable description of the API server's stable surface for external UIs, orchestrators, and plugin bridges.
@@ -244,6 +269,12 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
+    "run_event_replay": true,
+    "run_event_replay_version": 1,
+    "run_pending_action_status": true,
+    "run_pending_action_status_version": 1,
+    "run_runtime_identity": true,
+    "run_runtime_identity_version": 1,
     "run_stop": true,
     "run_approval_request_binding": true,
     "run_approval_structured_preview": true,
@@ -255,7 +286,11 @@ Returns a machine-readable description of the API server's stable surface for ex
     "profile_inventory": true,
     "profile_inventory_version": 1,
     "profile_inventory_complete": true,
-    "profile_inventory_requires_api_key": true
+    "profile_inventory_requires_api_key": true,
+    "profile_runtime_inventory": true,
+    "profile_runtime_inventory_version": 1,
+    "profile_runtime_inventory_complete": true,
+    "profile_runtime_inventory_requires_api_key": true
   }
 }
 ```
@@ -366,23 +401,49 @@ Poll the current run state. This is useful for dashboards that need status witho
   "run_id": "run_abc123",
   "status": "completed",
   "session_id": "space-session",
-  "model": "hermes-agent",
+  "runtime": {
+    "provider": "openrouter",
+    "model": "anthropic/claude-sonnet-4"
+  },
   "output": "Done.",
   "usage": {"input_tokens": 50, "output_tokens": 200, "total_tokens": 250}
 }
 ```
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
+While a run is waiting, runtimes advertising
+`run_pending_action_status` include the same bounded, request-bound approval or
+clarification object emitted by the stream. Clients may use it to recover the
+current UI after a genuine stream interruption, but must still validate and
+return the exact request ID.
 
 ### GET /v1/runs/\{run_id\}/events
 
-Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.
+Server-Sent Events stream of the run's tool-call progress, token deltas,
+effective runtime identity, and lifecycle events. Every event has a monotonic
+SSE `id` matching its JSON `sequence` and `event_id`. Each subscriber receives
+an independent copy, so one dashboard cannot consume another dashboard's
+events.
 
-Unconsumed event buffers expire after five minutes so a detached client cannot
-grow memory indefinitely. This expires transport state only: a run that is
-still executing remains visible to status polling, approval, stop control, and
-concurrency accounting until its executor work actually exits. A connected SSE
-subscriber continues draining normally.
+The server retains a fixed in-memory replay window capped by event count and
+aggregate encoded bytes. Events are normalized to a versioned public allowlist
+before retention: tool previews, raw commands, and reasoning bodies are not
+stored; assistant deltas use cross-chunk buffering before credential/path
+redaction. Credential assignment recognition is same-line: horizontal spaces
+and tabs may span chunks, while CR/LF terminates the lexical assignment.
+Terminal SSE events contain a bounded public output/error preview
+with an explicit completeness flag; poll `GET /v1/runs/{run_id}` for the
+authoritative bounded terminal result. Reconnect with
+`Last-Event-ID: <last verified id>` to receive only later events in order.
+Malformed, ahead-of-stream, or expired cursors fail closed. Replay does not
+survive a server restart. A live run retains its bounded journal through
+approval and clarification waits; the normal client path keeps that same SSE
+connection open until the run reaches a terminal event.
+
+Text buffering is flushed before tool, runtime, approval, clarification, and
+terminal events so sequence order remains source order. Credential labels and
+their following values are treated as one lexical unit even when split across
+provider deltas.
 
 ### POST /v1/runs/\{run_id\}/stop
 
@@ -394,6 +455,11 @@ running.
 ### POST /v1/runs/\{run_id\}/approval
 
 Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
+
+Request-bound clients send `request_id` and receive a matching
+`approval.responded` event. The legacy no-ID form remains supported; its event
+may omit `request_id`, so subscribers must reconcile current run status rather
+than clearing an exact local request from that unbound acknowledgement.
 
 Approval events include a stable `request_id` and a versioned `preview`. The
 preview contains fixed Hermes-owned categories and labels; it does not copy the
