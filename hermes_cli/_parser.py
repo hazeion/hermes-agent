@@ -117,10 +117,19 @@ def build_top_level_parser():
         metavar="PATH",
         default=None,
         help=(
-            "One-shot mode only: after the run, write a JSON usage report "
+            "After a one-shot or quiet single-query run, write a JSON usage report "
             "(estimated cost, token counts, model, api_calls) to PATH. "
             "The report is written even when the run fails, so pipelines "
-            "can always account for spend. No effect outside -z/--oneshot."
+            "can always account for spend."
+        ),
+    )
+    parser.add_argument(
+        "--progress-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Quiet single-query mode only: append versioned, redacted tool "
+            "lifecycle events as JSON Lines to PATH."
         ),
     )
     # --model / --provider are accepted at the top level so they can pair
@@ -329,6 +338,18 @@ def build_top_level_parser():
         "--quiet",
         action="store_true",
         help="Quiet mode for programmatic use: suppress banner, spinner, and tool previews. Only output the final response and session info.",
+    )
+    chat_parser.add_argument(
+        "--usage-file",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help="With --quiet, write a JSON usage report to PATH.",
+    )
+    chat_parser.add_argument(
+        "--progress-file",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help="With --quiet, append redacted progress events as JSON Lines to PATH.",
     )
     chat_parser.add_argument(
         "--resume",

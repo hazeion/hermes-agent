@@ -15913,6 +15913,8 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    usage_file: str = None,
+    progress_file: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -15948,6 +15950,10 @@ def main(
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
     global _active_worktree
+    mentat_usage_file = os.environ.pop("MENTAT_HERMES_USAGE_FILE", None)
+    mentat_progress_file = os.environ.pop("MENTAT_HERMES_PROGRESS_FILE", None)
+    usage_file_is_strict = False
+    progress_file_is_strict = False
 
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
@@ -16000,6 +16006,17 @@ def main(
     
     # Handle query shorthand
     query = query or q
+    if quiet:
+        # Trusted local dashboards can request optional telemetry through
+        # environment variables that older Hermes builds safely ignore. The
+        # variables are removed above before any tool subprocess can inherit
+        # Mentat's private runtime paths.
+        if not usage_file and mentat_usage_file:
+            usage_file = mentat_usage_file
+            usage_file_is_strict = True
+        if not progress_file and mentat_progress_file:
+            progress_file = mentat_progress_file
+            progress_file_is_strict = True
     
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
@@ -16297,15 +16314,38 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        from hermes_cli.structured_telemetry import (
+                            ProgressWriter,
+                            write_usage_file,
+                        )
+                        if progress_file:
+                            cli.agent.tool_progress_callback = ProgressWriter(
+                                progress_file,
+                                strict=progress_file_is_strict,
+                            ).callback
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
                             )
                         except KeyboardInterrupt:
+                            write_usage_file(
+                                usage_file,
+                                {},
+                                failure="interrupted",
+                                strict=usage_file_is_strict,
+                            )
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
+                        except Exception as exc:
+                            write_usage_file(
+                                usage_file,
+                                {},
+                                failure=type(exc).__name__,
+                                strict=usage_file_is_strict,
+                            )
+                            raise
                         # Sync session_id if mid-run compression created a
                         # continuation session. The exit line below reports
                         # session_id to stderr for automation wrappers; without
@@ -16316,6 +16356,12 @@ def main(
                         ):
                             cli.session_id = cli.agent.session_id
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        if isinstance(result, dict):
+                            write_usage_file(
+                                usage_file,
+                                result,
+                                strict=usage_file_is_strict,
+                            )
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout

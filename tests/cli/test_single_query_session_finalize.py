@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -200,17 +201,33 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
     ]
 
 
-def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):
+def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch, tmp_path):
     calls = []
+    agents = []
+    usage_path = tmp_path / "usage.json"
+    progress_path = tmp_path / "progress.jsonl"
+    usage_path.touch(mode=0o600)
+    progress_path.touch(mode=0o600)
 
     import cli as cli_mod
 
     def run_conversation(*, user_message, conversation_history):
         calls.append(("run", user_message, conversation_history))
+        agents[0].tool_progress_callback(
+            "tool.started",
+            "terminal",
+            "secret path /private/example",
+            {"token": "never-write"},
+        )
         return {
             "final_response": "",
             "error": "provider failed",
             "failed": True,
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "last_prompt_tokens": 1000,
+            "context_length": 32000,
         }
 
     class FakeCLI:
@@ -229,6 +246,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
                 tool_gen_callback=object(),
                 run_conversation=run_conversation,
             )
+            agents.append(self.agent)
 
         def _claim_active_session(self, surface, *, stderr=False):
             calls.append(("claim", surface, stderr))
@@ -253,6 +271,8 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.setenv("MENTAT_HERMES_USAGE_FILE", str(usage_path))
+    monkeypatch.setenv("MENTAT_HERMES_PROGRESS_FILE", str(progress_path))
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
     monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -262,9 +282,22 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        cli_mod.main(query="hello", quiet=True, toolsets="terminal")
+        cli_mod.main(
+            query="hello",
+            quiet=True,
+            toolsets="terminal",
+        )
 
     assert exc_info.value.code == 1
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+    usage = json.loads(usage_path.read_text())
+    assert usage["context_tokens"] == 1000
+    assert usage["context_length"] == 32000
+    progress = progress_path.read_text()
+    assert '"tool":"terminal"' in progress
+    assert "never-write" not in progress
+    assert "/private/example" not in progress
+    assert "MENTAT_HERMES_USAGE_FILE" not in cli_mod.os.environ
+    assert "MENTAT_HERMES_PROGRESS_FILE" not in cli_mod.os.environ

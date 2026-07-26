@@ -536,6 +536,7 @@ def _apply_profile_override() -> None:
         "-r", "--resume",
         "-s", "--skills",
         "--usage-file",
+        "--progress-file",
     }
     optional_value_flags = {"-c", "--continue"}
     i = 0
@@ -2614,6 +2615,8 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "usage_file": getattr(args, "usage_file", None),
+        "progress_file": getattr(args, "progress_file", None),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -13340,6 +13343,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-r", "--resume",
         "-s", "--skills",
         "--usage-file",
+        "--progress-file",
         # ``-c / --continue`` is nargs='?' (optional value). Treat it as
         # value-taking: if the next token is a subcommand-looking word
         # the user almost certainly meant it as the session name, and
