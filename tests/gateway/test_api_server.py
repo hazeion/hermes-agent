@@ -660,6 +660,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/profiles", adapter._handle_profiles)
+    app.router.add_get("/v1/profile-runtimes", adapter._handle_profile_runtimes)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
@@ -1103,6 +1104,7 @@ class TestProfilesEndpoint:
                 "served": True,
             },
         ]
+
         serialized = json.dumps(data)
         for forbidden in (
             "/private/",
@@ -1256,6 +1258,102 @@ class TestProfilesEndpoint:
 # ---------------------------------------------------------------------------
 # /v1/capabilities endpoint
 # ---------------------------------------------------------------------------
+
+
+class TestProfileRuntimeEndpoint:
+    @pytest.mark.asyncio
+    async def test_requires_configured_api_key_and_valid_bearer(self, adapter, auth_adapter):
+        unkeyed_app = _create_app(adapter)
+        async with TestClient(TestServer(unkeyed_app)) as cli:
+            unkeyed = await cli.get("/v1/profile-runtimes")
+            unkeyed_payload = await unkeyed.json()
+        assert unkeyed.status == 403
+        assert (
+            unkeyed_payload["error"]["code"]
+            == "profile_runtime_inventory_auth_required"
+        )
+
+        keyed_app = _create_app(auth_adapter)
+        async with TestClient(TestServer(keyed_app)) as cli:
+            unauthorized = await cli.get(
+                "/v1/profile-runtimes",
+                headers={"Authorization": "Bearer wrong"},
+            )
+        assert unauthorized.status == 401
+
+    @pytest.mark.asyncio
+    async def test_returns_only_bounded_provider_model_identity(self, auth_adapter):
+        default = MagicMock()
+        default.name = "default"
+        default.provider = "openai-codex"
+        default.model = "gpt-5.6"
+        researcher = MagicMock()
+        researcher.name = "researcher"
+        researcher.provider = "openrouter"
+        researcher.model = "anthropic/claude-sonnet-4"
+        with patch(
+            "hermes_cli.profiles.list_profiles",
+            return_value=[default, researcher],
+        ):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get(
+                    "/v1/profile-runtimes",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                payload = await response.json()
+
+        assert response.status == 200
+        assert payload == {
+            "object": "hermes.profile_runtime.list",
+            "version": 1,
+            "complete": True,
+            "data": [
+                {
+                    "profile_id": "default",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6",
+                },
+                {
+                    "profile_id": "researcher",
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4",
+                },
+            ],
+        }
+        serialized = json.dumps(payload)
+        assert "api_key" not in serialized
+        assert "path" not in serialized
+        assert "endpoint" not in serialized
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unsafe_model",
+        [
+            "https://private.example/model",
+            "sk-proj-" + ("a" * 32),
+            "openai/sk-proj-" + ("a" * 32),
+        ],
+    )
+    async def test_rejects_unsafe_runtime_identity_as_one_failed_snapshot(
+        self,
+        auth_adapter,
+        unsafe_model,
+    ):
+        unsafe = MagicMock()
+        unsafe.name = "default"
+        unsafe.provider = "openrouter"
+        unsafe.model = unsafe_model
+        with patch("hermes_cli.profiles.list_profiles", return_value=[unsafe]):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get(
+                    "/v1/profile-runtimes",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                payload = await response.json()
+        assert response.status == 503
+        assert payload["error"]["code"] == "profile_runtime_inventory_unavailable"
 
 
 class TestCapabilitiesEndpoint:
