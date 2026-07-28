@@ -661,6 +661,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/profiles", adapter._handle_profiles)
     app.router.add_get("/v1/profile-runtimes", adapter._handle_profile_runtimes)
+    app.router.add_get("/v1/profiles/{profile_id}/runtime", adapter._handle_profile_runtime)
+    app.router.add_post("/v1/profiles/{profile_id}/runtime/switch", adapter._handle_profile_runtime_switch)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
@@ -5151,3 +5153,109 @@ class TestSessionDbOffEventLoop:
             hermes_state.SessionDB = original_class
             auth_adapter._session_db = None
             auth_adapter._session_db_lock = None
+
+
+class TestProfileRuntimeSwitch:
+    @pytest.mark.asyncio
+    async def test_runtime_inventory_returns_bounded_runtime_for_served_profile(self, auth_adapter, monkeypatch):
+        runtime = {
+            "object": "hermes.profile.runtime",
+            "version": 1,
+            "profile_id": "default",
+            "provider": "one",
+            "model": "one-a",
+            "choices": [{"provider": "one", "models": ["one-a"]}],
+            "revision": "runtime_rev_" + "a" * 64,
+        }
+        monkeypatch.setattr(auth_adapter, "_is_served_profile", lambda profile_id: profile_id == "default")
+        monkeypatch.setattr(auth_adapter, "_read_profile_runtime", lambda profile_id: runtime)
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get(
+                "/v1/profiles/default/runtime",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload == runtime
+
+    @pytest.mark.asyncio
+    async def test_runtime_endpoints_reject_unserved_profile(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr(auth_adapter, "_is_served_profile", lambda _profile_id: False)
+        monkeypatch.setattr(
+            auth_adapter,
+            "_read_profile_runtime",
+            lambda _profile_id: pytest.fail("unserved profile must not read runtime"),
+        )
+        app = _create_app(auth_adapter)
+        body = {
+            "provider": "two",
+            "model": "two-b",
+            "revision": "runtime_rev_" + "a" * 64,
+            "idempotency_key": "switch-1",
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            get_response = await cli.get(
+                "/v1/profiles/not-served/runtime",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            get_payload = await get_response.json()
+            switch_response = await cli.post(
+                "/v1/profiles/not-served/runtime/switch",
+                json=body,
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            switch_payload = await switch_response.json()
+
+        assert get_response.status == switch_response.status == 404
+        assert get_payload["error"]["code"] == "profile_not_served"
+        assert switch_payload["error"]["code"] == "profile_not_served"
+
+    @pytest.mark.asyncio
+    async def test_switch_requires_current_revision_and_replays_idempotently(self, auth_adapter, monkeypatch):
+        before = {"object": "hermes.profile.runtime", "version": 1, "profile_id": "default", "provider": "one", "model": "one-a", "choices": [{"provider": "one", "models": ["one-a"]}, {"provider": "two", "models": ["two-b"]}], "revision": "runtime_rev_" + "a" * 64}
+        after = {**before, "provider": "two", "model": "two-b", "revision": "runtime_rev_" + "b" * 64}
+        reads = iter((before, after))
+        monkeypatch.setattr(auth_adapter, "_read_profile_runtime", lambda _profile: next(reads))
+        saved = []
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda config: saved.append(config))
+        monkeypatch.setattr(
+            "hermes_cli.web_server._apply_main_model_assignment",
+            lambda _cfg, provider, model, _base_url, _api_key: {"provider": provider, "default": model},
+        )
+        app = _create_app(auth_adapter)
+        body = {"provider": "two", "model": "two-b", "revision": before["revision"], "idempotency_key": "switch-1"}
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/profiles/default/runtime/switch", json=body, headers={"Authorization": "Bearer sk-secret"})
+            assert response.status == 200
+            payload = await response.json()
+            assert payload["runtime"] == after
+            assert saved == [{"model": {"provider": "two", "default": "two-b"}}]
+            replay = await cli.post("/v1/profiles/default/runtime/switch", json=body, headers={"Authorization": "Bearer sk-secret"})
+            assert await replay.json() == payload
+
+    @pytest.mark.asyncio
+    async def test_switch_refuses_active_profile_run(self, auth_adapter):
+        auth_adapter._run_statuses["run"] = {"profile_id": "default", "status": "running"}
+        app = _create_app(auth_adapter)
+        body = {"provider": "two", "model": "two-b", "revision": "runtime_rev_" + "a" * 64, "idempotency_key": "switch-1"}
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/profiles/default/runtime/switch", json=body, headers={"Authorization": "Bearer sk-secret"})
+            assert response.status == 409
+            assert (await response.json())["error"]["code"] == "profile_runtime_active"
+
+    @pytest.mark.asyncio
+    async def test_switch_rejects_changed_payload_for_reused_idempotency_key(self, auth_adapter, monkeypatch):
+        runtime = {"object": "hermes.profile.runtime", "version": 1, "profile_id": "default", "provider": "one", "model": "one-a", "choices": [{"provider": "one", "models": ["one-a"]}, {"provider": "two", "models": ["two-b", "two-c"]}], "revision": "runtime_rev_" + "a" * 64}
+        monkeypatch.setattr(auth_adapter, "_read_profile_runtime", lambda _profile: runtime)
+        auth_adapter._profile_runtime_idempotency[("default", "same-key")] = {"fingerprint": json.dumps({"provider": "two", "model": "two-b", "revision": runtime["revision"]}, sort_keys=True), "response": {"ok": True}}
+        app = _create_app(auth_adapter)
+        body = {"provider": "two", "model": "two-c", "revision": runtime["revision"], "idempotency_key": "same-key"}
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/profiles/default/runtime/switch", json=body, headers={"Authorization": "Bearer sk-secret"})
+            assert response.status == 409
+            assert (await response.json())["error"]["code"] == "profile_runtime_idempotency_conflict"

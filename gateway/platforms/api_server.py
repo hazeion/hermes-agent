@@ -63,6 +63,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from collections import deque
@@ -329,6 +330,11 @@ PROFILE_INVENTORY_VERSION = 1
 PROFILE_RUNTIME_INVENTORY_VERSION = 1
 MAX_PROFILE_INVENTORY_SIZE = 1_000
 PROFILE_INVENTORY_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+PROFILE_RUNTIME_VERSION = 1
+PROFILE_RUNTIME_REVISION_RE = re.compile(r"runtime_rev_[0-9a-f]{64}")
+_PROFILE_RUNTIME_ACTIVE_STATUSES = frozenset({
+    "queued", "running", "waiting_for_approval", "waiting_for_clarification", "stopping",
+})
 
 # ``/v1/runs`` is the controllable, pollable agent lifecycle intended for
 # remote control planes. Its image input is deliberately narrower than the
@@ -1383,6 +1389,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._active_continuation_sessions: Dict[
             tuple[Optional[str], str], str
         ] = {}
+        # Bounded per-process replay protection for revision-bound runtime changes.
+        # The response is retained only while this API server is alive; clients must
+        # always use the returned revision for a later independent mutation.
+        self._profile_runtime_idempotency: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._profile_runtime_locks: Dict[str, threading.RLock] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
         # Concurrency cap shared across all agent-serving endpoints
@@ -1884,7 +1895,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/v1/profiles", self._handle_profiles),
-            ("GET", "/v1/profile-runtimes", self._handle_profile_runtimes),
+    ("GET", "/v1/profile-runtimes", self._handle_profile_runtimes),
+    ("GET", "/v1/profiles/{profile_id}/runtime", self._handle_profile_runtime),
+    ("POST", "/v1/profiles/{profile_id}/runtime/switch", self._handle_profile_runtime_switch),
             ("GET", "/v1/kanban/boards", self._handle_kanban_boards),
             ("GET", "/v1/kanban/profiles", self._handle_kanban_profiles),
             ("GET", "/v1/kanban/tasks", self._handle_kanban_tasks),
@@ -2348,7 +2361,7 @@ class APIServerAdapter(BasePlatformAdapter):
             process_completion_queue_depth=process_depth,
             active_delegations=active_delegations,
         )
-        return web.json_response({
+        payload = {
             "status": readiness["status"],
             "readiness": readiness,
             "platform": "hermes-agent",
@@ -2370,7 +2383,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # the state file may carry legacy epoch floats or hand-edited junk.
             "updated_at": normalize_updated_at(runtime.get("updated_at")),
             "pid": os.getpid(),
-        })
+        }
+        return web.json_response(payload)
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — list hermes-agent and any configured model_routes aliases.
@@ -2502,7 +2516,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=503,
             )
 
-        return web.json_response({
+        payload = {
             "object": "list",
             "version": PROFILE_INVENTORY_VERSION,
             "complete": True,
@@ -2517,10 +2531,83 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
                 for profile_id in profile_ids
             ],
-        })
+        }
+        return web.json_response(payload)
+
+    def _profile_runtime_active(self, profile_id: str) -> bool:
+        """Whether a nonterminal API-server run currently owns *profile_id*."""
+        return any(
+            status.get("profile_id") == profile_id
+            and status.get("status") in _PROFILE_RUNTIME_ACTIVE_STATUSES
+            for status in self._run_statuses.values()
+        )
+
+    def _profile_runtime_lock(self, profile_id: str) -> threading.RLock:
+        return self._profile_runtime_locks.setdefault(profile_id, threading.RLock())
+
+    def _effective_api_profile(self) -> str:
+        selected = _api_request_profile.get()
+        if selected:
+            return selected
+        from hermes_cli.profiles import get_active_profile_name
+        runner = getattr(self, "gateway_runner", None)
+        config = getattr(runner, "config", None)
+        if bool(getattr(config, "multiplex_profiles", False)):
+            return "default"
+        return get_active_profile_name() or "default"
+
+    def _is_served_profile(self, profile_id: str) -> bool:
+        from hermes_cli.profiles import profiles_to_serve
+        runner = getattr(self, "gateway_runner", None)
+        config = getattr(runner, "config", None)
+        multiplex = bool(getattr(config, "multiplex_profiles", False))
+        if not multiplex:
+            return profile_id == self._effective_api_profile()
+        return profile_id in {name for name, _home in profiles_to_serve(multiplex=True)}
+
+    @staticmethod
+    def _runtime_revision(provider: str, model: str, choices: list[dict]) -> str:
+        canonical = json.dumps(
+            {"version": PROFILE_RUNTIME_VERSION, "provider": provider, "model": model, "choices": choices},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")
+        return "runtime_rev_" + hashlib.sha256(canonical).hexdigest()
+
+    def _read_profile_runtime(self, profile_id: str) -> Dict[str, Any]:
+        """Read one profile's secret-free, bounded model-switch inventory."""
+        from hermes_cli.config import load_config
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        with self._profile_scope(profile_id):
+            cfg = load_config()
+            model_cfg = cfg.get("model", {})
+            provider = str(model_cfg.get("provider", "") if isinstance(model_cfg, dict) else "").strip().lower()
+            model = str((model_cfg.get("default") or model_cfg.get("name") or "") if isinstance(model_cfg, dict) else model_cfg or "").strip()
+            payload = build_models_payload(
+                load_picker_context(), explicit_only=True, include_unconfigured=False,
+                picker_hints=False, canonical_order=True, pricing=False,
+                capabilities=False, refresh=False, probe_custom_providers=False,
+                probe_current_custom_provider=False, max_models=200,
+            )
+        choices = []
+        for row in payload.get("providers", [])[:100]:
+            slug = str(row.get("slug") or "").strip().lower()
+            models = row.get("models")
+            if not slug or not isinstance(models, list):
+                continue
+            ids = sorted({str(item).strip() for item in models[:200] if isinstance(item, str) and item.strip()})
+            if ids:
+                choices.append({"provider": slug, "models": ids})
+        if provider and model and not any(item["provider"] == provider and model in item["models"] for item in choices):
+            choices.append({"provider": provider, "models": [model]})
+        choices.sort(key=lambda item: item["provider"])
+        return {
+            "object": "hermes.profile.runtime", "version": PROFILE_RUNTIME_VERSION,
+            "profile_id": profile_id, "provider": provider, "model": model,
+            "choices": choices, "revision": self._runtime_revision(provider, model, choices),
+        }
 
     async def _handle_profile_runtimes(self, request: "web.Request") -> "web.Response":
-        """Return current profile provider/model identifiers without secrets."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -2578,6 +2665,76 @@ class APIServerAdapter(BasePlatformAdapter):
             "complete": True,
             "data": rows,
         })
+
+    async def _handle_profile_runtime(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(_openai_error("Profile runtime inventory requires API key authentication", code="profile_runtime_auth_required"), status=403)
+        profile_id = request.match_info["profile_id"]
+        if PROFILE_INVENTORY_ID_RE.fullmatch(profile_id) is None:
+            return web.json_response(_openai_error("Invalid profile identifier", code="invalid_profile"), status=400)
+        try:
+            if not await asyncio.to_thread(self._is_served_profile, profile_id):
+                return web.json_response(_openai_error("Profile is not served", code="profile_not_served"), status=404)
+            return web.json_response(await asyncio.to_thread(self._read_profile_runtime, profile_id))
+        except Exception:
+            logger.exception("GET profile runtime failed")
+            return web.json_response(_openai_error("Profile runtime is temporarily unavailable", code="profile_runtime_unavailable"), status=503)
+
+    async def _handle_profile_runtime_switch(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(_openai_error("Profile runtime switch requires API key authentication", code="profile_runtime_auth_required"), status=403)
+        profile_id = request.match_info["profile_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if PROFILE_INVENTORY_ID_RE.fullmatch(profile_id) is None or not isinstance(body, dict) or set(body) != {"provider", "model", "revision", "idempotency_key"}:
+            return web.json_response(_openai_error("Invalid profile runtime switch request", code="invalid_profile_runtime_switch"), status=400)
+        provider, model, revision, key = (body.get(name) for name in ("provider", "model", "revision", "idempotency_key"))
+        if not all(isinstance(value, str) and value.strip() for value in (provider, model, revision, key)) or len(key) > 128 or PROFILE_RUNTIME_REVISION_RE.fullmatch(revision) is None:
+            return web.json_response(_openai_error("Invalid profile runtime switch request", code="invalid_profile_runtime_switch"), status=400)
+        try:
+            def apply():
+                if not self._is_served_profile(profile_id):
+                    return 404, _openai_error("Profile is not served", code="profile_not_served")
+                fingerprint = json.dumps({"provider": provider.strip().lower(), "model": model.strip(), "revision": revision}, sort_keys=True)
+                idem = (profile_id, key)
+                with self._profile_runtime_lock(profile_id):
+                    prior = self._profile_runtime_idempotency.get(idem)
+                    if prior:
+                        if prior["fingerprint"] != fingerprint:
+                            return 409, _openai_error("Idempotency key was reused for another request", code="profile_runtime_idempotency_conflict")
+                        return 200, prior["response"]
+                    if self._profile_runtime_active(profile_id):
+                        return 409, _openai_error("Profile has an active run", code="profile_runtime_active")
+                    current = self._read_profile_runtime(profile_id)
+                    if revision != current["revision"]:
+                        return 409, _openai_error("Profile runtime changed", code="profile_runtime_changed")
+                    if not any(item["provider"] == provider.strip().lower() and model.strip() in item["models"] for item in current["choices"]):
+                        return 422, _openai_error("Provider/model pair is not available", code="profile_runtime_unavailable_choice")
+                    from hermes_cli.config import load_config, save_config
+                    from hermes_cli.web_server import _apply_main_model_assignment
+                    with self._profile_scope(profile_id):
+                        cfg = load_config()
+                        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider.strip().lower(), model.strip(), "", "")
+                        save_config(cfg)
+                    updated = self._read_profile_runtime(profile_id)
+                    response = {"object": "hermes.profile.runtime.switch", "idempotency_key": key, "runtime": updated}
+                    if len(self._profile_runtime_idempotency) >= 1000:
+                        self._profile_runtime_idempotency.pop(next(iter(self._profile_runtime_idempotency)))
+                    self._profile_runtime_idempotency[idem] = {"fingerprint": fingerprint, "response": response}
+                    return 200, response
+            status, result = await asyncio.to_thread(apply)
+            return web.json_response(result, status=status)
+        except Exception:
+            logger.exception("POST profile runtime switch failed")
+            return web.json_response(_openai_error("Profile runtime switch is temporarily unavailable", code="profile_runtime_switch_unavailable"), status=503)
 
     async def _kanban_api_call(self, request: "web.Request", operation, *args, **kwargs) -> "web.Response":
         """Run one bounded Kanban API operation behind the normal bearer gate."""
@@ -2677,7 +2834,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        return web.json_response({
+        payload = {
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
             "model": self._model_name,
@@ -2745,6 +2902,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "profile_runtime_inventory_version": PROFILE_RUNTIME_INVENTORY_VERSION,
                 "profile_runtime_inventory_complete": True,
                 "profile_runtime_inventory_requires_api_key": True,
+                "profile_runtime_switch": bool(self._api_key),
+                "profile_runtime_switch_version": PROFILE_RUNTIME_VERSION,
+                "profile_runtime_switch_revision_bound": True,
+                "profile_runtime_switch_idempotency": True,
+                "profile_runtime_switch_active_run_lock": True,
                 "kanban_api": bool(self._api_key),
                 "kanban_api_version": 1,
                 "kanban_api_revisioned": True,
@@ -2808,7 +2970,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
-        })
+        }
+        if self._api_key:
+            payload["endpoints"]["profile_runtime"] = {"method": "GET", "path": "/v1/profiles/{profile_id}/runtime", "version": PROFILE_RUNTIME_VERSION}
+            payload["endpoints"]["profile_runtime_switch"] = {"method": "POST", "path": "/v1/profiles/{profile_id}/runtime/switch", "version": PROFILE_RUNTIME_VERSION}
+        return web.json_response(payload)
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -6016,29 +6182,31 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
-        now = time.time()
         current = self._run_statuses.get(run_id, {})
-        if "output" in fields:
-            fields["output"] = _bounded_public_run_text(
-                fields["output"], limit=200_000
-            )
-        if "error" in fields:
-            fields["error"] = _bounded_public_run_text(
-                fields["error"], limit=2_000
-            )
-        current.update({
-            "object": "hermes.run",
-            "run_id": run_id,
-            "status": status,
-            "updated_at": now,
-        })
-        current.setdefault("created_at", fields.pop("created_at", now))
-        if fields.get("pending_action", object()) is None:
-            current.pop("pending_action", None)
-            fields.pop("pending_action", None)
-        current.update(fields)
-        self._run_statuses[run_id] = current
-        return current
+        profile_id = fields.get("profile_id") or current.get("profile_id") or "default"
+        with self._profile_runtime_lock(profile_id):
+            now = time.time()
+            if "output" in fields:
+                fields["output"] = _bounded_public_run_text(
+                    fields["output"], limit=200_000
+                )
+            if "error" in fields:
+                fields["error"] = _bounded_public_run_text(
+                    fields["error"], limit=2_000
+                )
+            current.update({
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": status,
+                "updated_at": now,
+            })
+            current.setdefault("created_at", fields.pop("created_at", now))
+            if fields.get("pending_action", object()) is None:
+                current.pop("pending_action", None)
+                fields.pop("pending_action", None)
+            current.update(fields)
+            self._run_statuses[run_id] = current
+            return current
 
     def _publish_run_event(self, run_id: str, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Sequence, retain, and broadcast one bounded public Runs event."""
@@ -6613,6 +6781,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "queued",
             created_at=created_at,
             session_id=session_id,
+            profile_id=self._effective_api_profile(),
             model=body.get("model", self._model_name),
             **(
                 {"continuation_version": RUN_SESSION_CONTINUATION_VERSION}

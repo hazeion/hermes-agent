@@ -761,6 +761,17 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 
 ## Limitations
 
+### Remote profile runtime switching
+
+Authenticated control planes can discover this optional surface through
+`GET /v1/capabilities`. Version one exposes a secret-free runtime inventory at
+`GET /v1/profiles/{profile_id}/runtime` and a revision-bound switch at
+`POST /v1/profiles/{profile_id}/runtime/switch`. The switch accepts only an
+advertised provider/model pair plus the exact inventory revision and an
+idempotency key. Hermes rejects stale revisions, mismatched idempotency-key
+reuse, unserved profiles, and profiles with an active API-server run. It never
+accepts provider credentials or endpoint URLs through this remote route.
+
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
 - **No file upload** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.
 - **Model field is cosmetic** — the `model` field in requests is accepted but the actual LLM model used is configured server-side in config.yaml.
