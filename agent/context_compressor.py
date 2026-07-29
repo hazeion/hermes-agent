@@ -975,6 +975,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_error = None
         self._last_compress_aborted = False
         self.last_real_prompt_tokens = 0
+        self.latest_provider_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
@@ -1113,6 +1114,7 @@ class ContextCompressor(ContextEngine):
         self._context_probed = False
         self._context_probe_persistable = False
         self.last_real_prompt_tokens = 0
+        self.latest_provider_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
@@ -1397,6 +1399,7 @@ class ContextCompressor(ContextEngine):
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.last_real_prompt_tokens = 0
+        self.latest_provider_prompt_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
@@ -1639,6 +1642,7 @@ class ContextCompressor(ContextEngine):
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_real_prompt_tokens = 0
+        self.latest_provider_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
@@ -1712,6 +1716,9 @@ class ContextCompressor(ContextEngine):
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
+        self.latest_provider_prompt_tokens = (
+            self.last_prompt_tokens if self.last_prompt_tokens > 0 else 0
+        )
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
         if self.last_prompt_tokens > 0:

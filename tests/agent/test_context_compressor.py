@@ -111,12 +111,16 @@ class TestUpdateFromResponse:
         assert compressor.last_prompt_tokens == 5000
         assert compressor.last_completion_tokens == 1000
         assert compressor.last_real_prompt_tokens == 5000
+        assert compressor.latest_provider_prompt_tokens == 5000
         assert compressor.last_rough_tokens_when_real_prompt_fit == 90_000
         assert compressor.awaiting_real_usage_after_compression is False
 
     def test_missing_fields_default_zero(self, compressor):
+        compressor.update_from_response({"prompt_tokens": 5000})
+        compressor.last_prompt_tokens = 9000  # a later rough preflight estimate
         compressor.update_from_response({})
         assert compressor.last_prompt_tokens == 0
+        assert compressor.latest_provider_prompt_tokens == 0
 
 class TestPreflightDeferral:
     def test_defers_when_recent_real_usage_fit_and_rough_growth_is_small(self, compressor):

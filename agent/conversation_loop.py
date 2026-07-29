@@ -665,6 +665,16 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _provider_reasoning_present(message: Any) -> bool:
+    """Return true only for an explicit provider reasoning field."""
+    return bool(getattr(message, "reasoning", None))
+
+
+def _reset_turn_context_measurement(agent: Any) -> None:
+    """Prevent provider usage from a prior turn crossing the turn boundary."""
+    agent.context_compressor.latest_provider_prompt_tokens = 0
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -718,6 +728,7 @@ def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
+    _reset_turn_context_measurement(agent)
     _ctx = build_turn_context(
         agent,
         user_message,
@@ -4776,10 +4787,12 @@ def run_conversation(
                 else:
                     agent._vprint(f"{agent.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
-            # Notify progress callback of model's thinking (used by subagent
-            # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
-                _think_text = assistant_message.content.strip()
+            # Subagents retain their existing concise text relay. Structured
+            # integrations receive only a fixed phase when the provider
+            # supplied genuine reasoning metadata; assistant prose alone is
+            # never classified as reasoning.
+            if agent.tool_progress_callback:
+                _think_text = (assistant_message.content or "").strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
                     r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
@@ -4792,9 +4805,14 @@ def run_conversation(
                         agent.tool_progress_callback("_thinking", first_line)
                     except Exception:
                         pass
-                elif _think_text:
+                elif _provider_reasoning_present(assistant_message):
                     try:
-                        agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
+                        agent.tool_progress_callback(
+                            "reasoning.available",
+                            "_thinking",
+                            None,
+                            None,
+                        )
                     except Exception:
                         pass
             
