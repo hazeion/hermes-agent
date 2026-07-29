@@ -124,19 +124,24 @@ def write_usage_file(
 
 def _write_server_owned_file(path: Path, payload: bytes, *, append: bool) -> None:
     """Write through a no-follow directory descriptor without creating paths."""
+    get_effective_uid = getattr(os, "geteuid", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
     if (
         os.open not in getattr(os, "supports_dir_fd", set())
-        or not hasattr(os, "geteuid")
+        or not callable(get_effective_uid)
+        or not isinstance(directory_flag, int)
+        or directory_flag == 0
+        or not isinstance(nofollow_flag, int)
+        or nofollow_flag == 0
     ):
         raise OSError("strict telemetry writes are unavailable")
     parent_fd = os.open(
         path.parent,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY | directory_flag | nofollow_flag,
     )
     try:
-        flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_WRONLY | nofollow_flag
         if append:
             flags |= os.O_APPEND
         descriptor = os.open(path.name, flags, dir_fd=parent_fd)
@@ -144,7 +149,7 @@ def _write_server_owned_file(path: Path, payload: bytes, *, append: bool) -> Non
             details = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(details.st_mode)
-                or details.st_uid != os.geteuid()
+                or details.st_uid != get_effective_uid()
                 or details.st_mode & 0o077
             ):
                 raise OSError("unsafe telemetry file")

@@ -166,3 +166,36 @@ def test_strict_channel_fails_closed_when_secure_dir_fd_is_unavailable(
         None,
     )
     assert path.read_text() == ""
+
+
+def test_strict_channel_fails_closed_without_posix_uid_api(
+    tmp_path,
+    monkeypatch,
+):
+    path = _server_owned(tmp_path / "progress.jsonl")
+    monkeypatch.delattr(telemetry.os, "geteuid", raising=False)
+    ProgressWriter(str(path), strict=True).callback(
+        "tool.started",
+        "terminal",
+        None,
+        None,
+    )
+    assert path.read_text() == ""
+
+
+def test_strict_channel_fails_closed_without_required_open_flags(
+    tmp_path,
+    monkeypatch,
+):
+    path = _server_owned(tmp_path / "progress.jsonl")
+    for flag_name in ("O_DIRECTORY", "O_NOFOLLOW"):
+        path.write_text("")
+        with monkeypatch.context() as context:
+            context.delattr(telemetry.os, flag_name, raising=False)
+            ProgressWriter(str(path), strict=True).callback(
+                "tool.started",
+                "terminal",
+                None,
+                None,
+            )
+        assert path.read_text() == ""
