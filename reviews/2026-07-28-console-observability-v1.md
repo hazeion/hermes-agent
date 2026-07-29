@@ -141,6 +141,18 @@ the publication gate for the supported cross-platform environments.
 - Compatibility/product reviewer: clear; the corrected fail-closed capability
   gate introduces no compatibility or product regression.
 
+### Publication CI repair
+
+- GitHub's contributor-attribution gate identified the original feature
+  commit's older local author email as unmapped.
+- Added the required one-file email-to-GitHub-user mapping without changing
+  commit authorship or feature behavior.
+- Contributor-map verification: 12 passed; static diff checks pass.
+- Final narrow safety/correctness re-review: clear; mapping is exact and changes
+  no executable behavior or authorship.
+- Final narrow compatibility/product re-review: clear; mapping is
+  attribution-only and compatibility-neutral.
+
 ## Documentation updates
 
 - Roadmap: pending outcome reconciliation.
