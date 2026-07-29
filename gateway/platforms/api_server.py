@@ -6916,7 +6916,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
+                    from gateway.run import _redact_approval_command
+
                     source = dict(approval_data or {})
+                    source["command"] = _redact_approval_command(
+                        source.get("command")
+                    )
                     try:
                         loop.call_soon_threadsafe(
                             _register_approval_event,
