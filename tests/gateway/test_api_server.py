@@ -32,6 +32,7 @@ from gateway.platforms.api_server import (
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
+    _api_request_profile,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -658,6 +659,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
+    app.router.add_get("/v1/profiles", adapter._handle_profiles)
+    app.router.add_get("/v1/profile-runtimes", adapter._handle_profile_runtimes)
+    app.router.add_get("/v1/profiles/{profile_id}/runtime", adapter._handle_profile_runtime)
+    app.router.add_post("/v1/profiles/{profile_id}/runtime/switch", adapter._handle_profile_runtime_switch)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
@@ -1018,8 +1023,339 @@ class TestModelsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# /v1/profiles endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestProfilesEndpoint:
+    @pytest.mark.asyncio
+    async def test_requires_configured_api_key_before_enumeration(self, adapter):
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            side_effect=AssertionError("inventory must not run"),
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/profiles")
+                assert resp.status == 403
+                data = await resp.json()
+                assert data["error"]["code"] == "profile_inventory_auth_required"
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_bearer_before_enumeration(self, auth_adapter):
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            side_effect=AssertionError("inventory must not run"),
+        ):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer wrong"},
+                )
+                assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_returns_complete_allowlisted_inventory(self, auth_adapter):
+        auth_adapter.gateway_runner = MagicMock()
+        auth_adapter.gateway_runner.config.multiplex_profiles = False
+
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[
+                ("default", "/private/default"),
+                ("builder", "/private/profiles/builder"),
+            ],
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="builder",
+        ):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert set(data) == {
+            "object",
+            "version",
+            "complete",
+            "active_profile",
+            "data",
+        }
+        assert data["object"] == "list"
+        assert data["version"] == 1
+        assert data["complete"] is True
+        assert data["active_profile"] == "builder"
+        assert data["data"] == [
+            {
+                "id": "default",
+                "object": "hermes.profile",
+                "is_default": True,
+                "is_active": False,
+                "served": False,
+            },
+            {
+                "id": "builder",
+                "object": "hermes.profile",
+                "is_default": False,
+                "is_active": True,
+                "served": True,
+            },
+        ]
+
+        serialized = json.dumps(data)
+        for forbidden in (
+            "/private/",
+            "description",
+            "provider",
+            "model",
+            "alias",
+            "distribution",
+            "skill",
+            "env",
+        ):
+            assert forbidden not in serialized
+
+    @pytest.mark.asyncio
+    async def test_multiplex_marks_every_inventory_profile_served(self, auth_adapter):
+        auth_adapter.gateway_runner = MagicMock()
+        auth_adapter.gateway_runner.config.multiplex_profiles = True
+        rows = [
+            ("default", "/private/default"),
+            ("builder", "/private/profiles/builder"),
+        ]
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=rows,
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="default",
+        ):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert [item["served"] for item in data["data"]] == [True, True]
+        assert [item["is_active"] for item in data["data"]] == [True, False]
+
+    @pytest.mark.asyncio
+    async def test_prefixed_profile_is_reported_as_active(self, auth_adapter):
+        auth_adapter.gateway_runner = MagicMock()
+        auth_adapter.gateway_runner.config.multiplex_profiles = True
+        rows = [
+            ("default", "/private/default"),
+            ("builder", "/private/profiles/builder"),
+        ]
+        request = MagicMock()
+        request.headers = {"Authorization": "Bearer sk-secret"}
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=rows,
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="default",
+        ):
+            token = _api_request_profile.set("builder")
+            try:
+                response = await auth_adapter._handle_profiles(request)
+            finally:
+                _api_request_profile.reset(token)
+
+        assert response.status == 200
+        data = json.loads(response.body)
+        assert data["active_profile"] == "builder"
+        assert [item["is_active"] for item in data["data"]] == [False, True]
+
+    @pytest.mark.asyncio
+    async def test_invalid_inventory_fails_closed_without_reflection(self, auth_adapter):
+        private_path = "/Users/operator/.hermes/profiles/builder"
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", "/private/default"), ("default", private_path)],
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="default",
+        ):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 503
+                body = await resp.text()
+
+        assert private_path not in body
+        assert "duplicate" not in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("profile_id", ["../escape", "Uppercase", "bad profile", ""])
+    async def test_unsafe_profile_id_fails_closed(self, auth_adapter, profile_id):
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", "/private/default"), (profile_id, "/private/other")],
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="default",
+        ):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 503
+                data = await resp.json()
+
+        assert data["error"]["code"] == "profile_inventory_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_missing_active_profile_fails_closed(self, auth_adapter):
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", "/private/default")],
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="builder",
+        ):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 503
+                data = await resp.json()
+
+        assert data["error"]["code"] == "profile_inventory_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_oversized_inventory_is_rejected_as_incomplete(self, auth_adapter):
+        rows = [("default", "/private/default")]
+        rows.extend((f"profile-{index}", f"/private/{index}") for index in range(1000))
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=rows,
+        ):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 409
+                data = await resp.json()
+                assert data["error"]["code"] == "profile_inventory_too_large"
+
+
+# ---------------------------------------------------------------------------
 # /v1/capabilities endpoint
 # ---------------------------------------------------------------------------
+
+
+class TestProfileRuntimeEndpoint:
+    @pytest.mark.asyncio
+    async def test_requires_configured_api_key_and_valid_bearer(self, adapter, auth_adapter):
+        unkeyed_app = _create_app(adapter)
+        async with TestClient(TestServer(unkeyed_app)) as cli:
+            unkeyed = await cli.get("/v1/profile-runtimes")
+            unkeyed_payload = await unkeyed.json()
+        assert unkeyed.status == 403
+        assert (
+            unkeyed_payload["error"]["code"]
+            == "profile_runtime_inventory_auth_required"
+        )
+
+        keyed_app = _create_app(auth_adapter)
+        async with TestClient(TestServer(keyed_app)) as cli:
+            unauthorized = await cli.get(
+                "/v1/profile-runtimes",
+                headers={"Authorization": "Bearer wrong"},
+            )
+        assert unauthorized.status == 401
+
+    @pytest.mark.asyncio
+    async def test_returns_only_bounded_provider_model_identity(self, auth_adapter):
+        default = MagicMock()
+        default.name = "default"
+        default.provider = "openai-codex"
+        default.model = "gpt-5.6"
+        researcher = MagicMock()
+        researcher.name = "researcher"
+        researcher.provider = "openrouter"
+        researcher.model = "anthropic/claude-sonnet-4"
+        with patch(
+            "hermes_cli.profiles.list_profiles",
+            return_value=[default, researcher],
+        ):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get(
+                    "/v1/profile-runtimes",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                payload = await response.json()
+
+        assert response.status == 200
+        assert payload == {
+            "object": "hermes.profile_runtime.list",
+            "version": 1,
+            "complete": True,
+            "data": [
+                {
+                    "profile_id": "default",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6",
+                },
+                {
+                    "profile_id": "researcher",
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4",
+                },
+            ],
+        }
+        serialized = json.dumps(payload)
+        assert "api_key" not in serialized
+        assert "path" not in serialized
+        assert "endpoint" not in serialized
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unsafe_model",
+        [
+            "https://private.example/model",
+            "sk-proj-" + ("a" * 32),
+            "openai/sk-proj-" + ("a" * 32),
+        ],
+    )
+    async def test_rejects_unsafe_runtime_identity_as_one_failed_snapshot(
+        self,
+        auth_adapter,
+        unsafe_model,
+    ):
+        unsafe = MagicMock()
+        unsafe.name = "default"
+        unsafe.provider = "openrouter"
+        unsafe.model = unsafe_model
+        with patch("hermes_cli.profiles.list_profiles", return_value=[unsafe]):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get(
+                    "/v1/profile-runtimes",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                payload = await response.json()
+        assert response.status == 503
+        assert payload["error"]["code"] == "profile_runtime_inventory_unavailable"
 
 
 class TestCapabilitiesEndpoint:
@@ -1042,8 +1378,37 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["run_approval_request_binding"] is True
+            assert data["features"]["run_approval_structured_preview"] is True
+            assert data["features"]["run_approval_preview_version"] == 1
+            assert data["features"]["run_clarification_response"] is True
+            assert data["features"]["run_clarification_request_binding"] is True
+            assert data["features"]["run_clarification_prompt_version"] == 1
+            assert data["features"]["clarification_events"] is True
+            assert data["features"]["run_inline_images"] is True
+            assert data["features"]["run_inline_images_version"] == 1
+            assert data["features"]["run_inline_images_data_urls_only"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
+            assert data["features"]["profile_inventory"] is False
+            assert data["features"]["profile_inventory_version"] == 1
+            assert data["features"]["profile_inventory_complete"] is True
+            assert data["features"]["profile_inventory_requires_api_key"] is True
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
+            assert data["endpoints"]["run_clarification"] == {
+                "method": "POST",
+                "path": "/v1/runs/{run_id}/clarification",
+            }
+            assert data["endpoints"]["profiles"] == {"method": "GET", "path": "/v1/profiles"}
+            assert data["endpoints"]["run_inline_images"] == {
+                "method": "POST",
+                "path": "/v1/runs",
+                "version": 1,
+                "input": "OpenAI content parts: input_text and input_image",
+                "image_transport": "data_url_only",
+                "mime_types": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+                "max_count": 4,
+                "max_bytes_per_image": 5 * 1024 * 1024,
+            }
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
 
@@ -1061,6 +1426,7 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+            assert data["features"]["profile_inventory"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -4787,3 +5153,109 @@ class TestSessionDbOffEventLoop:
             hermes_state.SessionDB = original_class
             auth_adapter._session_db = None
             auth_adapter._session_db_lock = None
+
+
+class TestProfileRuntimeSwitch:
+    @pytest.mark.asyncio
+    async def test_runtime_inventory_returns_bounded_runtime_for_served_profile(self, auth_adapter, monkeypatch):
+        runtime = {
+            "object": "hermes.profile.runtime",
+            "version": 1,
+            "profile_id": "default",
+            "provider": "one",
+            "model": "one-a",
+            "choices": [{"provider": "one", "models": ["one-a"]}],
+            "revision": "runtime_rev_" + "a" * 64,
+        }
+        monkeypatch.setattr(auth_adapter, "_is_served_profile", lambda profile_id: profile_id == "default")
+        monkeypatch.setattr(auth_adapter, "_read_profile_runtime", lambda profile_id: runtime)
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get(
+                "/v1/profiles/default/runtime",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload == runtime
+
+    @pytest.mark.asyncio
+    async def test_runtime_endpoints_reject_unserved_profile(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr(auth_adapter, "_is_served_profile", lambda _profile_id: False)
+        monkeypatch.setattr(
+            auth_adapter,
+            "_read_profile_runtime",
+            lambda _profile_id: pytest.fail("unserved profile must not read runtime"),
+        )
+        app = _create_app(auth_adapter)
+        body = {
+            "provider": "two",
+            "model": "two-b",
+            "revision": "runtime_rev_" + "a" * 64,
+            "idempotency_key": "switch-1",
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            get_response = await cli.get(
+                "/v1/profiles/not-served/runtime",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            get_payload = await get_response.json()
+            switch_response = await cli.post(
+                "/v1/profiles/not-served/runtime/switch",
+                json=body,
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            switch_payload = await switch_response.json()
+
+        assert get_response.status == switch_response.status == 404
+        assert get_payload["error"]["code"] == "profile_not_served"
+        assert switch_payload["error"]["code"] == "profile_not_served"
+
+    @pytest.mark.asyncio
+    async def test_switch_requires_current_revision_and_replays_idempotently(self, auth_adapter, monkeypatch):
+        before = {"object": "hermes.profile.runtime", "version": 1, "profile_id": "default", "provider": "one", "model": "one-a", "choices": [{"provider": "one", "models": ["one-a"]}, {"provider": "two", "models": ["two-b"]}], "revision": "runtime_rev_" + "a" * 64}
+        after = {**before, "provider": "two", "model": "two-b", "revision": "runtime_rev_" + "b" * 64}
+        reads = iter((before, after))
+        monkeypatch.setattr(auth_adapter, "_read_profile_runtime", lambda _profile: next(reads))
+        saved = []
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda config: saved.append(config))
+        monkeypatch.setattr(
+            "hermes_cli.web_server._apply_main_model_assignment",
+            lambda _cfg, provider, model, _base_url, _api_key: {"provider": provider, "default": model},
+        )
+        app = _create_app(auth_adapter)
+        body = {"provider": "two", "model": "two-b", "revision": before["revision"], "idempotency_key": "switch-1"}
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/profiles/default/runtime/switch", json=body, headers={"Authorization": "Bearer sk-secret"})
+            assert response.status == 200
+            payload = await response.json()
+            assert payload["runtime"] == after
+            assert saved == [{"model": {"provider": "two", "default": "two-b"}}]
+            replay = await cli.post("/v1/profiles/default/runtime/switch", json=body, headers={"Authorization": "Bearer sk-secret"})
+            assert await replay.json() == payload
+
+    @pytest.mark.asyncio
+    async def test_switch_refuses_active_profile_run(self, auth_adapter):
+        auth_adapter._run_statuses["run"] = {"profile_id": "default", "status": "running"}
+        app = _create_app(auth_adapter)
+        body = {"provider": "two", "model": "two-b", "revision": "runtime_rev_" + "a" * 64, "idempotency_key": "switch-1"}
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/profiles/default/runtime/switch", json=body, headers={"Authorization": "Bearer sk-secret"})
+            assert response.status == 409
+            assert (await response.json())["error"]["code"] == "profile_runtime_active"
+
+    @pytest.mark.asyncio
+    async def test_switch_rejects_changed_payload_for_reused_idempotency_key(self, auth_adapter, monkeypatch):
+        runtime = {"object": "hermes.profile.runtime", "version": 1, "profile_id": "default", "provider": "one", "model": "one-a", "choices": [{"provider": "one", "models": ["one-a"]}, {"provider": "two", "models": ["two-b", "two-c"]}], "revision": "runtime_rev_" + "a" * 64}
+        monkeypatch.setattr(auth_adapter, "_read_profile_runtime", lambda _profile: runtime)
+        auth_adapter._profile_runtime_idempotency[("default", "same-key")] = {"fingerprint": json.dumps({"provider": "two", "model": "two-b", "revision": runtime["revision"]}, sort_keys=True), "response": {"ok": True}}
+        app = _create_app(auth_adapter)
+        body = {"provider": "two", "model": "two-c", "revision": runtime["revision"], "idempotency_key": "same-key"}
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/profiles/default/runtime/switch", json=body, headers={"Authorization": "Bearer sk-secret"})
+            assert response.status == 409
+            assert (await response.json())["error"]["code"] == "profile_runtime_idempotency_conflict"

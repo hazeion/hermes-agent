@@ -198,6 +198,61 @@ Delete a stored response.
 
 Lists the agent as an available model. The advertised model name defaults to the [profile](/user-guide/profiles) name (or `hermes-agent` for the default profile). Required by most frontends for model discovery.
 
+### GET /v1/profiles
+
+Returns the complete profile roster using only canonical IDs and safe routing
+state. A configured `API_SERVER_KEY` is always required.
+
+```json
+{
+  "object": "list",
+  "version": 1,
+  "complete": true,
+  "active_profile": "default",
+  "data": [
+    {
+      "id": "default",
+      "object": "hermes.profile",
+      "is_default": true,
+      "is_active": true,
+      "served": true
+    }
+  ]
+}
+```
+
+`served` means the current gateway can serve that profile. In single-profile
+mode only the active profile is served; a multiplex gateway serves every
+profile in the returned roster. The endpoint never returns profile paths,
+descriptions, aliases, provider/model settings, distribution metadata, skill
+counts, environment state, or credentials. It fails instead of returning a
+partial or malformed inventory.
+
+### GET /v1/profile-runtimes
+
+Returns a complete, read-only runtime identity snapshot for the profile roster.
+A configured `API_SERVER_KEY` is always required.
+
+```json
+{
+  "object": "hermes.profile_runtime.list",
+  "version": 1,
+  "complete": true,
+  "data": [
+    {
+      "profile_id": "default",
+      "provider": "openrouter",
+      "model": "anthropic/claude-sonnet-4"
+    }
+  ]
+}
+```
+
+Only bounded opaque provider/model IDs are returned. URLs, paths,
+credential-shaped identifiers, environment names, authentication metadata,
+and partial snapshots fail closed. This endpoint grants read visibility only;
+it is not a provider-switching API.
+
 ### GET /v1/capabilities
 
 Returns a machine-readable description of the API server's stable surface for external UIs, orchestrators, and plugin bridges.
@@ -214,7 +269,28 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
-    "run_stop": true
+    "run_event_replay": true,
+    "run_event_replay_version": 1,
+    "run_pending_action_status": true,
+    "run_pending_action_status_version": 1,
+    "run_runtime_identity": true,
+    "run_runtime_identity_version": 1,
+    "run_stop": true,
+    "run_approval_request_binding": true,
+    "run_approval_structured_preview": true,
+    "run_approval_preview_version": 1,
+    "run_session_continuation": true,
+    "run_session_continuation_version": 1,
+    "run_session_continuation_exact_revision": true,
+    "run_session_continuation_stoppable": true,
+    "profile_inventory": true,
+    "profile_inventory_version": 1,
+    "profile_inventory_complete": true,
+    "profile_inventory_requires_api_key": true,
+    "profile_runtime_inventory": true,
+    "profile_runtime_inventory_version": 1,
+    "profile_runtime_inventory_complete": true,
+    "profile_runtime_inventory_requires_api_key": true
   }
 }
 ```
@@ -252,7 +328,68 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 }
 ```
 
-Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
+Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs. That field alone does not load persisted history; use the exact continuation contract below when continuing a Hermes session.
+
+### Continue an exact session through Runs
+
+First request a descriptor for the selected session:
+
+```text
+GET /v1/sessions/{session_id}/continuation
+```
+
+Hermes resolves a compression root to its current tip and returns a content-free
+descriptor bound to that tip and the exact active message identities/history:
+
+```json
+{
+  "object": "hermes.session.continuation",
+  "version": 1,
+  "session_id": "resolved-session-tip",
+  "revision": "sessionrev_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+Pass that object unchanged in the next Runs request:
+
+```json
+{
+  "input": "Continue with the next step",
+  "continuation": {
+    "version": 1,
+    "session_id": "resolved-session-tip",
+    "revision": "sessionrev_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  }
+}
+```
+
+Hermes recalculates the binding before allocating the run. A changed message,
+replaced message identity, newer compression tip, malformed descriptor, or
+second active continuation fails closed. Do not combine `continuation` with
+`session_id`, `conversation_history`, `previous_response_id`, or a multi-message
+input. Once accepted, the turn uses the normal Runs status, events, approval,
+and stop endpoints. Descriptors are authenticated binding data, not bearer
+credentials or durable leases.
+
+When a controllable run needs an image, `input` may instead be a compact
+OpenAI-style content-part array:
+
+```json
+{
+  "input": [
+    {"type": "input_text", "text": "Describe this screenshot."},
+    {"type": "input_image", "image_url": "data:image/png;base64,..."}
+  ]
+}
+```
+
+Runs accepts up to four inline PNG, JPEG, GIF, or WebP images, each up to 5
+MiB. It deliberately accepts only `data:image/...;base64` values—no web URLs,
+file uploads, or local paths—so this controllable endpoint cannot fetch a
+private network URL or inspect the Hermes host. The same Run keeps its usual
+status, events, approval, and stop controls. Discover the exact version and
+limits through `features.run_inline_images` and `endpoints.run_inline_images`
+in `/v1/capabilities` before sending images.
 
 ### GET /v1/runs/\{run_id\}
 
@@ -264,23 +401,49 @@ Poll the current run state. This is useful for dashboards that need status witho
   "run_id": "run_abc123",
   "status": "completed",
   "session_id": "space-session",
-  "model": "hermes-agent",
+  "runtime": {
+    "provider": "openrouter",
+    "model": "anthropic/claude-sonnet-4"
+  },
   "output": "Done.",
   "usage": {"input_tokens": 50, "output_tokens": 200, "total_tokens": 250}
 }
 ```
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
+While a run is waiting, runtimes advertising
+`run_pending_action_status` include the same bounded, request-bound approval or
+clarification object emitted by the stream. Clients may use it to recover the
+current UI after a genuine stream interruption, but must still validate and
+return the exact request ID.
 
 ### GET /v1/runs/\{run_id\}/events
 
-Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.
+Server-Sent Events stream of the run's tool-call progress, token deltas,
+effective runtime identity, and lifecycle events. Every event has a monotonic
+SSE `id` matching its JSON `sequence` and `event_id`. Each subscriber receives
+an independent copy, so one dashboard cannot consume another dashboard's
+events.
 
-Unconsumed event buffers expire after five minutes so a detached client cannot
-grow memory indefinitely. This expires transport state only: a run that is
-still executing remains visible to status polling, approval, stop control, and
-concurrency accounting until its executor work actually exits. A connected SSE
-subscriber continues draining normally.
+The server retains a fixed in-memory replay window capped by event count and
+aggregate encoded bytes. Events are normalized to a versioned public allowlist
+before retention: tool previews, raw commands, and reasoning bodies are not
+stored; assistant deltas use cross-chunk buffering before credential/path
+redaction. Credential assignment recognition is same-line: horizontal spaces
+and tabs may span chunks, while CR/LF terminates the lexical assignment.
+Terminal SSE events contain a bounded public output/error preview
+with an explicit completeness flag; poll `GET /v1/runs/{run_id}` for the
+authoritative bounded terminal result. Reconnect with
+`Last-Event-ID: <last verified id>` to receive only later events in order.
+Malformed, ahead-of-stream, or expired cursors fail closed. Replay does not
+survive a server restart. A live run retains its bounded journal through
+approval and clarification waits; the normal client path keeps that same SSE
+connection open until the run reaches a terminal event.
+
+Text buffering is flushed before tool, runtime, approval, clarification, and
+terminal events so sequence order remains source order. Credential labels and
+their following values are treated as one lexical unit even when split across
+provider deltas.
 
 ### POST /v1/runs/\{run_id\}/stop
 
@@ -292,6 +455,69 @@ running.
 ### POST /v1/runs/\{run_id\}/approval
 
 Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
+
+Request-bound clients send `request_id` and receive a matching
+`approval.responded` event. The legacy no-ID form remains supported; its event
+may omit `request_id`, so subscribers must reconcile current run status rather
+than clearing an exact local request from that unbound acknowledgement.
+
+Approval events include a stable `request_id` and a versioned `preview`. The
+preview contains fixed Hermes-owned categories and labels; it does not copy the
+command, description, plugin reason, credentials, or paths. Clients that show
+approval controls should require the request-binding and structured-preview
+capabilities, render only `preview`, and send the same ID back:
+
+```json
+{
+  "choice": "once",
+  "request_id": "7db61e705f29476a8456efcc4ec03f08"
+}
+```
+
+Hermes resolves only the matching queued request. A stale or unknown ID returns
+`409` without resolving a newer request. Exact request binding cannot be
+combined with `all` or `resolve_all`.
+
+For compatibility, callers that omit `request_id` retain the older FIFO
+behavior. New external UIs should not use that legacy mode for an approval they
+displayed because another responder may have changed the queue first.
+
+### POST /v1/runs/\{run_id\}/clarification
+
+When the agent needs a missing detail, the event stream emits a bounded,
+secret-redacted `clarify.request` with a stable `request_id` and a versioned
+prompt. Choice prompts use server-issued IDs:
+
+```json
+{
+  "event": "clarify.request",
+  "run_id": "run_abc123",
+  "request_id": "clarify_0123456789abcdef0123456789abcdef",
+  "prompt": {
+    "version": 1,
+    "type": "choice",
+    "question": "Which environment should I use?",
+    "choices": [
+      {"id": "choice-1", "label": "Staging"},
+      {"id": "choice-2", "label": "Production"}
+    ]
+  }
+}
+```
+
+Answer that exact request with a choice ID:
+
+```json
+{
+  "request_id": "clarify_0123456789abcdef0123456789abcdef",
+  "response": {"type": "choice", "choice_id": "choice-1"}
+}
+```
+
+For an open question, send
+`{"type": "text", "text": "your answer"}`. Unknown, stale, already answered,
+or cross-run request IDs fail closed. Check `run_clarification_response` and
+`run_clarification_request_binding` in `/v1/capabilities` before showing this UI.
 
 ## Jobs API (background scheduled work)
 
@@ -341,6 +567,7 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `PATCH` | `/api/sessions/{id}` | Update title or `end_reason` |
 | `DELETE` | `/api/sessions/{id}` | Delete a session |
 | `GET` | `/api/sessions/{id}/messages` | Message history for a session |
+| `GET` | `/v1/sessions/{id}/continuation` | Issue an exact revision descriptor for a stoppable Runs continuation |
 | `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
 | `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, `run.completed` events |
@@ -375,6 +602,31 @@ curl http://localhost:8642/v1/toolsets \
 ```
 
 `/v1/skills` returns the same metadata the skills hub uses internally. `/v1/toolsets` returns toolsets resolved for the `api_server` platform with the concrete `tools` list each one expands to. Both are advertised under `endpoints.*` in `/v1/capabilities`.
+
+## Revision-aware Kanban API
+
+External control planes can use the bearer-authenticated `/v1/kanban` surface
+instead of dashboard routes or Kanban database files. Discover it first through
+`GET /v1/capabilities`: look for `kanban_api`, `kanban_api_revisioned`, and
+`kanban_api_idempotency`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/kanban/boards` | Bounded board records |
+| `GET` | `/v1/kanban/profiles?board=default` | Bounded assignee/profile records |
+| `GET` / `POST` | `/v1/kanban/tasks?board=default` | List tasks or create one idempotently |
+| `GET` | `/v1/kanban/tasks/{task_id}?board=default` | Exact task snapshot and revision |
+| `POST` | `/v1/kanban/tasks/{task_id}/actions?board=default` | Revision-bound action and read-back |
+
+Task details include a `kanbanrev_…` revision. Send that exact value plus a
+new idempotency key with every action. The API rejects stale state before it
+changes anything, and a safe retry returns fresh state without repeating the
+operation. Supported actions are `assign`, `comment`/`reply`, `promote`,
+`block`, `retry`, and `terminate`.
+
+The API intentionally omits attachment locations, worker PIDs and locks, run
+metadata, and raw event payloads. It is a server-to-server control surface, not
+a replacement for the authenticated interactive dashboard.
 
 ## Long-term memory scoping (`X-Hermes-Session-Key`)
 
@@ -508,6 +760,17 @@ Each profile's API server automatically advertises the profile name as the model
 In Open WebUI, add each as a separate connection. The model dropdown shows `alice` and `bob` as distinct models, each backed by a fully isolated Hermes instance. See the [Open WebUI guide](/user-guide/messaging/open-webui#multi-user-setup-with-profiles) for details.
 
 ## Limitations
+
+### Remote profile runtime switching
+
+Authenticated control planes can discover this optional surface through
+`GET /v1/capabilities`. Version one exposes a secret-free runtime inventory at
+`GET /v1/profiles/{profile_id}/runtime` and a revision-bound switch at
+`POST /v1/profiles/{profile_id}/runtime/switch`. The switch accepts only an
+advertised provider/model pair plus the exact inventory revision and an
+idempotency key. Hermes rejects stale revisions, mismatched idempotency-key
+reuse, unserved profiles, and profiles with an active API-server run. It never
+accepts provider credentials or endpoint URLs through this remote route.
 
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
 - **No file upload** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.

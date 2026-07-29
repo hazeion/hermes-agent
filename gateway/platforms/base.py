@@ -2452,6 +2452,7 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_message: Optional[str] = None
         self._fatal_error_retryable = True
         self._fatal_error_handler: Optional[Callable[["BasePlatformAdapter"], Awaitable[None] | None]] = None
+        self._approval_authorizer: Optional[Callable[[SessionSource], bool]] = None
         # Cross-HERMES_HOME token takeover is armed by GatewayRunner only for
         # an adapter's initial connect during an explicit ``gateway run
         # --replace`` startup.  Ordinary starts and every reconnect fail safe
@@ -2795,6 +2796,20 @@ class BasePlatformAdapter(ABC):
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
+
+    def set_approval_authorizer(self, authorizer: Callable[[SessionSource], bool]) -> None:
+        """Register the gateway's approval authorization check."""
+        self._approval_authorizer = authorizer
+
+    def is_approval_actor_authorized(self, source: SessionSource) -> bool:
+        """Check whether a button-click actor may resolve interactive approvals."""
+        if self._approval_authorizer is None:
+            return True
+        try:
+            return bool(self._approval_authorizer(source))
+        except Exception:
+            logger.exception("Approval authorizer failed for %s", source.to_dict())
+            return False
 
     def _mark_connected(self) -> None:
         self._running = True

@@ -7,17 +7,26 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
+- GET  /v1/profiles                — lists bounded, safe Hermes profile identities
+- GET  /v1/profile-runtimes        — lists current secret-free provider/model identities
+- GET  /v1/kanban/boards           — bounded revision-aware Kanban board records
+- GET  /v1/kanban/profiles         — bounded Kanban assignee/profile records
+- GET/POST /v1/kanban/tasks        — bounded task listing and idempotent creation
+- GET  /v1/kanban/tasks/{task_id}  — exact task snapshot with revision
+- POST /v1/kanban/tasks/{task_id}/actions — revision-bound fixed task actions
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- GET  /v1/sessions/{session_id}/continuation — issue an exact Runs continuation descriptor
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
+- POST /v1/runs/{run_id}/clarification — answer an exact pending clarification
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
@@ -40,6 +49,8 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import errno
 import hashlib
 import hmac
@@ -52,10 +63,12 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -68,10 +81,173 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
+_RUN_CLARIFY_PROMPT_VERSION = 1
+_RUN_CLARIFY_MAX_QUESTION_CHARS = 2000
+_RUN_CLARIFY_MAX_CHOICE_CHARS = 500
+_RUN_CLARIFY_MAX_RESPONSE_CHARS = 2000
+_RUN_CLARIFY_REQUEST_ID_RE = re.compile(r"^clarify_[0-9a-f]{32}$")
+_RUN_EVENT_CURSOR_RE = re.compile(r"0|[1-9][0-9]{0,9}")
+_RUNTIME_PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}")
+_RUNTIME_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,159}")
+_RUNTIME_SECRET_PREFIX_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:sk-(?:proj-)?|gh[pousr]_|github_pat_|xox[baprs]-|AIza|AKIA|ASIA|eyJ)"
+)
+_RUNTIME_SECRET_SEGMENT_RE = re.compile(
+    r"(?i)(?:^|[./_:@-])(?:api.?key|secret|token|password|passwd|bearer|authorization)(?:$|[./_:@-])"
+)
+_RUN_EVENT_RETENTION = 2048
+_RUN_EVENT_MAX_BYTES = 32 * 1024
+_RUN_EVENT_JOURNAL_MAX_BYTES = 4 * 1024 * 1024
+_RUN_DELTA_TAIL_CHARS = 256
+_RUN_DELTA_MAX_UNBROKEN_CHARS = 16_000
+_RUN_CREDENTIAL_PROBE_CHARS = 128
+_RUN_PUBLIC_PATH_TOKEN_RE = re.compile(r"(?<!\S)\S*[\\/]\S*(?!\S)")
+_RUN_CREDENTIAL_VALUE_RE = re.compile(
+    r"(?i)\b(?:authorization|api[ _-]?key|access[ _-]?token|token|password|passwd|secret)"
+    r"\b[ \t]*[:=][ \t]*(?:bearer[ \t]+)?"
+    r"(?:\"[^\"\r\n]*(?:\"|$)|'[^'\r\n]*(?:'|$)|[^\s,;]+)"
+    r"|\bbearer[ \t]+(?:\"[^\"\r\n]*(?:\"|$)|'[^'\r\n]*(?:'|$)|[^\s,;]+)"
+)
+_RUN_INCOMPLETE_CREDENTIAL_RE = re.compile(
+    r"(?i)(?:\b(?:authorization|api[ _-]?key|access[ _-]?token|token|password|passwd|secret)"
+    r"\b[ \t]*[:=][ \t]*[\"']?(?:bearer[ \t]*)?|\bbearer[ \t]+[\"']?)$"
+)
+_RUN_CREDENTIAL_ASSIGNMENT_STEMS = tuple(
+    f"{label}{delimiter}"
+    for label in (
+        "authorization",
+        "apikey",
+        "accesstoken",
+        "token",
+        "password",
+        "passwd",
+        "secret",
+    )
+    for delimiter in (":", "=")
+)
+_RUN_CREDENTIAL_PROBE_STEMS = _RUN_CREDENTIAL_ASSIGNMENT_STEMS + ("bearer",)
+
+
+def _bounded_public_run_text(value: Any, *, limit: int) -> str:
+    """Redact secret/path-shaped Runs text before status or replay retention."""
+
+    text = _RUN_CREDENTIAL_VALUE_RE.sub(
+        "[credential removed]",
+        str(value or ""),
+    )
+    text = redact_sensitive_text(text, force=True).replace("\x00", "")
+
+    def _redact_path_token(_match: "re.Match[str]") -> str:
+        return "[private reference removed]"
+
+    text = _RUN_PUBLIC_PATH_TOKEN_RE.sub(_redact_path_token, text)
+    return text[:limit]
+
+
+def _safe_runtime_identity(provider: str, model: str, *, allow_empty: bool) -> bool:
+    """Validate only opaque provider/model IDs, never URLs or filesystem paths."""
+    if not provider and not model:
+        return allow_empty
+    if not provider or not model:
+        return False
+    return (
+        _RUNTIME_PROVIDER_RE.fullmatch(provider) is not None
+        and _RUNTIME_MODEL_RE.fullmatch(model) is not None
+        and "://" not in model
+        and not model.startswith(("/", "."))
+        and "\\" not in model
+        and ".." not in model
+        and _RUNTIME_SECRET_PREFIX_RE.search(provider) is None
+        and _RUNTIME_SECRET_PREFIX_RE.search(model) is None
+        and _RUNTIME_SECRET_SEGMENT_RE.search(provider) is None
+        and _RUNTIME_SECRET_SEGMENT_RE.search(model) is None
+    )
+
+
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+
+
+_APPROVAL_PREVIEW_COPY = {
+    "terminal_command": (
+        "Terminal command approval",
+        "Hermes stopped a terminal command that matched a protected action.",
+    ),
+    "code_execution": (
+        "Code execution approval",
+        "Hermes stopped generated code that can change files or start processes.",
+    ),
+    "tool_policy": (
+        "Tool policy approval",
+        "A Hermes policy stopped a tool action for explicit approval.",
+    ),
+    "external_consent": (
+        "External consent request",
+        "An external tool requested explicit consent through Hermes.",
+    ),
+    "security_scan": (
+        "Security review approval",
+        "A Hermes security check stopped an action for explicit approval.",
+    ),
+    "protected_action": (
+        "Protected action approval",
+        "Hermes stopped an action that requires explicit approval.",
+    ),
+}
+
+
+def _safe_approval_preview(approval_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a bounded preview without echoing approval payload text.
+
+    Commands, descriptions, plugin reasons, and scanner findings are untrusted
+    and may contain credentials or private paths. Only labels that originate in
+    Hermes' built-in dangerous-command catalog are eligible for ``risk_labels``;
+    every other field comes from the fixed copy table above.
+    """
+    raw_keys = approval_data.get("pattern_keys")
+    if not isinstance(raw_keys, (list, tuple)):
+        raw_keys = [approval_data.get("pattern_key")]
+    keys = {
+        value
+        for value in raw_keys[:32]
+        if isinstance(value, str) and 0 < len(value) <= 160
+    }
+
+    try:
+        from tools.approval import DANGEROUS_PATTERNS
+
+        safe_reason_labels = {
+            description
+            for _, description in DANGEROUS_PATTERNS
+            if isinstance(description, str)
+        }
+    except Exception:
+        safe_reason_labels = set()
+
+    risk_labels = sorted(keys & safe_reason_labels)[:4]
+    if "execute_code" in keys:
+        category = "code_execution"
+    elif "mcp_elicitation" in keys:
+        category = "external_consent"
+    elif risk_labels:
+        category = "terminal_command"
+    elif any(key.startswith("plugin_rule:") for key in keys):
+        category = "tool_policy"
+    elif any(key.startswith("tirith:") for key in keys):
+        category = "security_scan"
+    else:
+        category = "protected_action"
+
+    title, summary = _APPROVAL_PREVIEW_COPY[category]
+    return {
+        "version": 1,
+        "category": category,
+        "title": title,
+        "summary": summary,
+        "risk_labels": risk_labels,
+    }
 
 
 try:
@@ -127,6 +303,56 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+RUN_SESSION_CONTINUATION_VERSION = 1
+RUN_SESSION_CONTINUATION_REVISION_RE = re.compile(r"sessionrev_[0-9a-f]{64}")
+
+
+def _run_session_continuation_revision(
+    session_id: str,
+    conversation_history: List[Dict[str, Any]],
+    message_ids: List[int],
+) -> str:
+    """Hash the exact normalized history used for a continued Runs turn."""
+    canonical = json.dumps(
+        {
+            "version": RUN_SESSION_CONTINUATION_VERSION,
+            "session_id": session_id,
+            "message_ids": message_ids,
+            "conversation_history": conversation_history,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sessionrev_{hashlib.sha256(canonical).hexdigest()}"
+PROFILE_INVENTORY_VERSION = 1
+PROFILE_RUNTIME_INVENTORY_VERSION = 1
+MAX_PROFILE_INVENTORY_SIZE = 1_000
+PROFILE_INVENTORY_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+PROFILE_RUNTIME_VERSION = 1
+PROFILE_RUNTIME_REVISION_RE = re.compile(r"runtime_rev_[0-9a-f]{64}")
+_PROFILE_RUNTIME_ACTIVE_STATUSES = frozenset({
+    "queued", "running", "waiting_for_approval", "waiting_for_clarification", "stopping",
+})
+
+# ``/v1/runs`` is the controllable, pollable agent lifecycle intended for
+# remote control planes. Its image input is deliberately narrower than the
+# chat/responses surface: callers can send a small, inline image they already
+# possess, but cannot cause the Hermes host to fetch a URL or inspect a local
+# path. The values are advertised through ``/v1/capabilities``.
+RUN_INLINE_IMAGE_MAX_COUNT = 4
+RUN_INLINE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+RUN_INLINE_IMAGE_MIME_TYPES = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+})
+_RUN_INLINE_IMAGE_DATA_URL_RE = re.compile(
+    r"^data:(image/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$",
+    re.IGNORECASE,
+)
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -422,6 +648,87 @@ def _normalize_multimodal_content(content: Any) -> Any:
         return "\n".join(p["text"] for p in normalized_parts if p.get("text"))
 
     return normalized_parts
+
+
+def _normalize_run_input(raw_input: Any) -> Any:
+    """Normalize a bounded, path-free Runs message.
+
+    Plain string input retains the original Runs contract. A structured Runs
+    input uses the same OpenAI content-part shape as chat/responses, but image
+    references are intentionally restricted to validated inline data URLs.
+    This avoids turning an authenticated remote control endpoint into an SSRF
+    fetcher or a local-file transport while preserving the exact Runs status,
+    event, approval, and stop lifecycle.
+
+    Raises ``ValueError`` with an ``error_code:message`` value suitable for an
+    OpenAI-style client error. Validation completes before a run ID, stream,
+    or agent is allocated.
+    """
+    if isinstance(raw_input, str):
+        return raw_input
+    if not isinstance(raw_input, list) or not raw_input:
+        raise ValueError("invalid_run_input:No user message found in input")
+
+    # Accept direct content parts (the compact form suited to Runs) as well as
+    # the existing Responses-style list of message objects. Earlier messages
+    # continue through the established conversation-history path below.
+    if all(isinstance(item, dict) and "type" in item for item in raw_input):
+        content = raw_input
+    else:
+        last = raw_input[-1]
+        if not isinstance(last, dict) or "content" not in last:
+            raise ValueError("invalid_run_input:No user message found in input")
+        content = last.get("content")
+
+    normalized = _normalize_multimodal_content(content)
+    if not normalized:
+        raise ValueError("invalid_run_input:No user message found in input")
+    if isinstance(normalized, str):
+        return normalized
+
+    image_count = 0
+    text_length = 0
+    for part in normalized:
+        if part.get("type") == "text":
+            text_length += len(str(part.get("text") or ""))
+            continue
+        if part.get("type") != "image_url":
+            raise ValueError("invalid_run_input:Runs input contains an unsupported content part")
+        image_count += 1
+        if image_count > RUN_INLINE_IMAGE_MAX_COUNT:
+            raise ValueError(
+                f"run_image_limit:Runs accepts at most {RUN_INLINE_IMAGE_MAX_COUNT} inline images"
+            )
+        image_ref = part.get("image_url")
+        url_value = image_ref.get("url") if isinstance(image_ref, dict) else None
+        detail = image_ref.get("detail") if isinstance(image_ref, dict) else None
+        if detail not in (None, "low", "high", "auto"):
+            raise ValueError(
+                "run_image_detail_unsupported:Runs image detail must be low, high, or auto"
+            )
+        match = _RUN_INLINE_IMAGE_DATA_URL_RE.fullmatch(str(url_value or ""))
+        if not match:
+            raise ValueError(
+                "run_image_data_url_required:Runs images must use an inline data:image/...;base64 URL"
+            )
+        mime_type = match.group(1).lower()
+        if mime_type not in RUN_INLINE_IMAGE_MIME_TYPES:
+            raise ValueError("run_image_mime_unsupported:Runs image MIME type is unsupported")
+        encoded = match.group(2)
+        # Reject oversized input before decoding, then check decoded bytes so
+        # the advertised limit is exact even for padded base64 input.
+        if len(encoded) > ((RUN_INLINE_IMAGE_MAX_BYTES + 2) // 3) * 4:
+            raise ValueError("run_image_too_large:Runs inline image exceeds the size limit")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("invalid_image_url:Runs image data URL has invalid base64") from exc
+        if not decoded or len(decoded) > RUN_INLINE_IMAGE_MAX_BYTES:
+            raise ValueError("run_image_too_large:Runs inline image exceeds the size limit")
+
+    if text_length > MAX_NORMALIZED_TEXT_LENGTH:
+        raise ValueError("run_text_too_large:Runs inline input has too much text")
+    return normalized
 
 
 def _content_has_visible_payload(content: Any) -> bool:
@@ -1041,8 +1348,19 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
+        # Active run transports. The compatibility queue remains bounded for
+        # internal callers, while SSE subscribers consume independent queues
+        # fed from the retained event journal below.
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        self._run_event_logs: Dict[str, Deque[Dict[str, Any]]] = {}
+        self._run_event_log_bytes: Dict[str, int] = {}
+        self._run_delta_buffers: Dict[str, str] = {}
+        self._run_redact_until_newline: set[str] = set()
+        self._run_credential_prefixes: Dict[str, str] = {}
+        self._run_event_sequences: Dict[str, int] = {}
+        self._run_subscriber_queues: Dict[
+            str, set["asyncio.Queue[Optional[Dict[str, Any]]]"]
+        ] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
@@ -1058,6 +1376,24 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Clarify requests use the same per-run isolation rule as approvals,
+        # but remain a separate primitive and response endpoint.
+        self._run_clarify_sessions: Dict[str, str] = {}
+        # Safe, request-bound recovery state. These maps contain only the same
+        # bounded public previews/prompts emitted through the Runs contract.
+        self._run_pending_approvals: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._run_pending_clarifications: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # Exact Runs continuations are single-writer per resolved session tip.
+        # Values are the run IDs that own the in-process claim until their
+        # executor-backed work has fully exited.
+        self._active_continuation_sessions: Dict[
+            tuple[Optional[str], str], str
+        ] = {}
+        # Bounded per-process replay protection for revision-bound runtime changes.
+        # The response is retained only while this API server is alive; clients must
+        # always use the returned revision for a later independent mutation.
+        self._profile_runtime_idempotency: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._profile_runtime_locks: Dict[str, threading.RLock] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
         # Concurrency cap shared across all agent-serving endpoints
@@ -1138,13 +1474,13 @@ class APIServerAdapter(BasePlatformAdapter):
         active_api_runs = sum(
             1
             for status in self._run_statuses.values()
-            # "stopping" (set by _handle_stop_run) is not terminal: the run
-            # stays in this state, doing real executor-thread work, until the
-            # agent actually notices the interrupt and the task settles to
-            # "cancelled" — an unbounded window, not the old ~5s hard-timeout
-            # wait. Excluding it here undercounts active_api_runs for the
-            # whole duration of a cooperative stop.
-            if status.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
+            if status.get("status") in {
+                "queued",
+                "running",
+                "waiting_for_approval",
+                "waiting_for_clarification",
+                "stopping",
+            }
         )
         process_depth = 0
         active_delegations = 0
@@ -1558,6 +1894,16 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
+            ("GET", "/v1/profiles", self._handle_profiles),
+    ("GET", "/v1/profile-runtimes", self._handle_profile_runtimes),
+    ("GET", "/v1/profiles/{profile_id}/runtime", self._handle_profile_runtime),
+    ("POST", "/v1/profiles/{profile_id}/runtime/switch", self._handle_profile_runtime_switch),
+            ("GET", "/v1/kanban/boards", self._handle_kanban_boards),
+            ("GET", "/v1/kanban/profiles", self._handle_kanban_profiles),
+            ("GET", "/v1/kanban/tasks", self._handle_kanban_tasks),
+            ("POST", "/v1/kanban/tasks", self._handle_create_kanban_task),
+            ("GET", "/v1/kanban/tasks/{task_id}", self._handle_kanban_task),
+            ("POST", "/v1/kanban/tasks/{task_id}/actions", self._handle_kanban_action),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
@@ -1567,6 +1913,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            (
+                "GET",
+                "/v1/sessions/{session_id}/continuation",
+                self._handle_session_continuation,
+            ),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -1590,6 +1941,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+            ("POST", "/v1/runs/{run_id}/clarification", self._handle_run_clarification),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -1829,6 +2181,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        clarify_callback=None,
+        enable_clarify: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1849,6 +2203,11 @@ class APIServerAdapter(BasePlatformAdapter):
         routing).  When set — and no session ``/model`` override exists for
         this session — its model/provider/api_key/base_url override the
         global defaults for this agent instance only.
+
+        ``enable_clarify`` is reserved for the Runs lifecycle, whose typed,
+        request-bound HTTP response route can safely satisfy the callback.
+        Other API surfaces remain headless even when their configured toolset
+        would otherwise include ``clarify``.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -1923,7 +2282,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = set(_get_platform_tools(user_config, "api_server"))
+        if enable_clarify:
+            enabled_toolsets.add("clarify")
+        enabled_toolsets = sorted(enabled_toolsets)
 
         max_iterations = _current_max_iterations()
 
@@ -1946,6 +2308,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            clarify_callback=clarify_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -1998,7 +2361,7 @@ class APIServerAdapter(BasePlatformAdapter):
             process_completion_queue_depth=process_depth,
             active_delegations=active_delegations,
         )
-        return web.json_response({
+        payload = {
             "status": readiness["status"],
             "readiness": readiness,
             "platform": "hermes-agent",
@@ -2020,7 +2383,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # the state file may carry legacy epoch floats or hand-edited junk.
             "updated_at": normalize_updated_at(runtime.get("updated_at")),
             "pid": os.getpid(),
-        })
+        }
+        return web.json_response(payload)
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — list hermes-agent and any configured model_routes aliases.
@@ -2070,6 +2434,395 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"object": "list", "data": models})
 
+    async def _handle_profiles(self, request: "web.Request") -> "web.Response":
+        """GET /v1/profiles — return a complete, secret-free profile roster.
+
+        The broader local ``ProfileInfo`` object contains paths,
+        provider/model configuration, aliases, distribution metadata, and
+        user-authored description text. None of those fields cross this
+        boundary.
+
+        A configured API key is required even on loopback so this inventory
+        stays on the explicit server-to-server authentication boundary.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    "Profile inventory requires API key authentication",
+                    code="profile_inventory_auth_required",
+                ),
+                status=403,
+            )
+
+        try:
+            from hermes_cli.profiles import (
+                get_active_profile_name,
+                profiles_to_serve,
+            )
+
+            raw_profiles = profiles_to_serve(multiplex=True)
+            if len(raw_profiles) > MAX_PROFILE_INVENTORY_SIZE:
+                return web.json_response(
+                    _openai_error(
+                        "Profile inventory is too large to return safely",
+                        code="profile_inventory_too_large",
+                    ),
+                    status=409,
+                )
+
+            profile_ids: List[str] = []
+            seen: set[str] = set()
+            for raw_name, _profile_home in raw_profiles:
+                if not isinstance(raw_name, str):
+                    raise ValueError("non-string profile identifier")
+                profile_id = raw_name.strip()
+                if PROFILE_INVENTORY_ID_RE.fullmatch(profile_id) is None:
+                    raise ValueError("invalid profile identifier")
+                if profile_id in seen:
+                    raise ValueError("duplicate profile identifier")
+                seen.add(profile_id)
+                profile_ids.append(profile_id)
+
+            if "default" not in seen:
+                raise ValueError("default profile missing")
+
+            runner = getattr(self, "gateway_runner", None)
+            config = getattr(runner, "config", None)
+            multiplex = bool(getattr(config, "multiplex_profiles", False))
+            active_profile = (
+                _api_request_profile.get()
+                or get_active_profile_name()
+                or "default"
+            )
+            if PROFILE_INVENTORY_ID_RE.fullmatch(active_profile) is None:
+                raise ValueError("invalid active profile identifier")
+            if active_profile not in seen:
+                raise ValueError("active profile missing from inventory")
+            # Derive serving state from the same complete roster snapshot.
+            # A second directory scan could race a concurrent profile change
+            # and accidentally label a stale/partial result as complete.
+            served_ids = set(profile_ids) if multiplex else {active_profile}
+        except Exception:
+            logger.exception("GET /v1/profiles failed")
+            return web.json_response(
+                _openai_error(
+                    "Profile inventory is temporarily unavailable",
+                    err_type="server_error",
+                    code="profile_inventory_unavailable",
+                ),
+                status=503,
+            )
+
+        payload = {
+            "object": "list",
+            "version": PROFILE_INVENTORY_VERSION,
+            "complete": True,
+            "active_profile": active_profile,
+            "data": [
+                {
+                    "id": profile_id,
+                    "object": "hermes.profile",
+                    "is_default": profile_id == "default",
+                    "is_active": profile_id == active_profile,
+                    "served": profile_id in served_ids,
+                }
+                for profile_id in profile_ids
+            ],
+        }
+        return web.json_response(payload)
+
+    def _profile_runtime_active(self, profile_id: str) -> bool:
+        """Whether a nonterminal API-server run currently owns *profile_id*."""
+        return any(
+            status.get("profile_id") == profile_id
+            and status.get("status") in _PROFILE_RUNTIME_ACTIVE_STATUSES
+            for status in self._run_statuses.values()
+        )
+
+    def _profile_runtime_lock(self, profile_id: str) -> threading.RLock:
+        return self._profile_runtime_locks.setdefault(profile_id, threading.RLock())
+
+    def _effective_api_profile(self) -> str:
+        selected = _api_request_profile.get()
+        if selected:
+            return selected
+        from hermes_cli.profiles import get_active_profile_name
+        runner = getattr(self, "gateway_runner", None)
+        config = getattr(runner, "config", None)
+        if bool(getattr(config, "multiplex_profiles", False)):
+            return "default"
+        return get_active_profile_name() or "default"
+
+    def _is_served_profile(self, profile_id: str) -> bool:
+        from hermes_cli.profiles import profiles_to_serve
+        runner = getattr(self, "gateway_runner", None)
+        config = getattr(runner, "config", None)
+        multiplex = bool(getattr(config, "multiplex_profiles", False))
+        if not multiplex:
+            return profile_id == self._effective_api_profile()
+        return profile_id in {name for name, _home in profiles_to_serve(multiplex=True)}
+
+    @staticmethod
+    def _runtime_revision(provider: str, model: str, choices: list[dict]) -> str:
+        canonical = json.dumps(
+            {"version": PROFILE_RUNTIME_VERSION, "provider": provider, "model": model, "choices": choices},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")
+        return "runtime_rev_" + hashlib.sha256(canonical).hexdigest()
+
+    def _read_profile_runtime(self, profile_id: str) -> Dict[str, Any]:
+        """Read one profile's secret-free, bounded model-switch inventory."""
+        from hermes_cli.config import load_config
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        with self._profile_scope(profile_id):
+            cfg = load_config()
+            model_cfg = cfg.get("model", {})
+            provider = str(model_cfg.get("provider", "") if isinstance(model_cfg, dict) else "").strip().lower()
+            model = str((model_cfg.get("default") or model_cfg.get("name") or "") if isinstance(model_cfg, dict) else model_cfg or "").strip()
+            payload = build_models_payload(
+                load_picker_context(), explicit_only=True, include_unconfigured=False,
+                picker_hints=False, canonical_order=True, pricing=False,
+                capabilities=False, refresh=False, probe_custom_providers=False,
+                probe_current_custom_provider=False, max_models=200,
+            )
+        choices = []
+        for row in payload.get("providers", [])[:100]:
+            slug = str(row.get("slug") or "").strip().lower()
+            models = row.get("models")
+            if not slug or not isinstance(models, list):
+                continue
+            ids = sorted({str(item).strip() for item in models[:200] if isinstance(item, str) and item.strip()})
+            if ids:
+                choices.append({"provider": slug, "models": ids})
+        if provider and model and not any(item["provider"] == provider and model in item["models"] for item in choices):
+            choices.append({"provider": provider, "models": [model]})
+        choices.sort(key=lambda item: item["provider"])
+        return {
+            "object": "hermes.profile.runtime", "version": PROFILE_RUNTIME_VERSION,
+            "profile_id": profile_id, "provider": provider, "model": model,
+            "choices": choices, "revision": self._runtime_revision(provider, model, choices),
+        }
+
+    async def _handle_profile_runtimes(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    "Profile runtime inventory requires API key authentication",
+                    code="profile_runtime_inventory_auth_required",
+                ),
+                status=403,
+            )
+        try:
+            from hermes_cli.profiles import list_profiles
+
+            raw_profiles = list_profiles()
+            if not raw_profiles or len(raw_profiles) > MAX_PROFILE_INVENTORY_SIZE:
+                raise ValueError("invalid profile runtime inventory size")
+            rows: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for profile in raw_profiles:
+                profile_id = str(getattr(profile, "name", "") or "").strip()
+                provider = str(getattr(profile, "provider", "") or "").strip()
+                model = str(getattr(profile, "model", "") or "").strip()
+                if (
+                    PROFILE_INVENTORY_ID_RE.fullmatch(profile_id) is None
+                    or profile_id in seen
+                    or not _safe_runtime_identity(
+                        provider,
+                        model,
+                        allow_empty=True,
+                    )
+                ):
+                    raise ValueError("unsafe profile runtime identity")
+                seen.add(profile_id)
+                rows.append({
+                    "profile_id": profile_id,
+                    "provider": provider,
+                    "model": model,
+                })
+            if "default" not in seen:
+                raise ValueError("default profile runtime missing")
+        except Exception:
+            logger.exception("GET /v1/profile-runtimes failed")
+            return web.json_response(
+                _openai_error(
+                    "Profile runtime inventory is temporarily unavailable",
+                    err_type="server_error",
+                    code="profile_runtime_inventory_unavailable",
+                ),
+                status=503,
+            )
+        return web.json_response({
+            "object": "hermes.profile_runtime.list",
+            "version": PROFILE_RUNTIME_INVENTORY_VERSION,
+            "complete": True,
+            "data": rows,
+        })
+
+    async def _handle_profile_runtime(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(_openai_error("Profile runtime inventory requires API key authentication", code="profile_runtime_auth_required"), status=403)
+        profile_id = request.match_info["profile_id"]
+        if PROFILE_INVENTORY_ID_RE.fullmatch(profile_id) is None:
+            return web.json_response(_openai_error("Invalid profile identifier", code="invalid_profile"), status=400)
+        try:
+            if not await asyncio.to_thread(self._is_served_profile, profile_id):
+                return web.json_response(_openai_error("Profile is not served", code="profile_not_served"), status=404)
+            return web.json_response(await asyncio.to_thread(self._read_profile_runtime, profile_id))
+        except Exception:
+            logger.exception("GET profile runtime failed")
+            return web.json_response(_openai_error("Profile runtime is temporarily unavailable", code="profile_runtime_unavailable"), status=503)
+
+    async def _handle_profile_runtime_switch(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(_openai_error("Profile runtime switch requires API key authentication", code="profile_runtime_auth_required"), status=403)
+        profile_id = request.match_info["profile_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if PROFILE_INVENTORY_ID_RE.fullmatch(profile_id) is None or not isinstance(body, dict) or set(body) != {"provider", "model", "revision", "idempotency_key"}:
+            return web.json_response(_openai_error("Invalid profile runtime switch request", code="invalid_profile_runtime_switch"), status=400)
+        provider, model, revision, key = (body.get(name) for name in ("provider", "model", "revision", "idempotency_key"))
+        if not all(isinstance(value, str) and value.strip() for value in (provider, model, revision, key)) or len(key) > 128 or PROFILE_RUNTIME_REVISION_RE.fullmatch(revision) is None:
+            return web.json_response(_openai_error("Invalid profile runtime switch request", code="invalid_profile_runtime_switch"), status=400)
+        try:
+            def apply():
+                if not self._is_served_profile(profile_id):
+                    return 404, _openai_error("Profile is not served", code="profile_not_served")
+                fingerprint = json.dumps({"provider": provider.strip().lower(), "model": model.strip(), "revision": revision}, sort_keys=True)
+                idem = (profile_id, key)
+                with self._profile_runtime_lock(profile_id):
+                    prior = self._profile_runtime_idempotency.get(idem)
+                    if prior:
+                        if prior["fingerprint"] != fingerprint:
+                            return 409, _openai_error("Idempotency key was reused for another request", code="profile_runtime_idempotency_conflict")
+                        return 200, prior["response"]
+                    if self._profile_runtime_active(profile_id):
+                        return 409, _openai_error("Profile has an active run", code="profile_runtime_active")
+                    current = self._read_profile_runtime(profile_id)
+                    if revision != current["revision"]:
+                        return 409, _openai_error("Profile runtime changed", code="profile_runtime_changed")
+                    if not any(item["provider"] == provider.strip().lower() and model.strip() in item["models"] for item in current["choices"]):
+                        return 422, _openai_error("Provider/model pair is not available", code="profile_runtime_unavailable_choice")
+                    from hermes_cli.config import load_config, save_config
+                    from hermes_cli.web_server import _apply_main_model_assignment
+                    with self._profile_scope(profile_id):
+                        cfg = load_config()
+                        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider.strip().lower(), model.strip(), "", "")
+                        save_config(cfg)
+                    updated = self._read_profile_runtime(profile_id)
+                    response = {"object": "hermes.profile.runtime.switch", "idempotency_key": key, "runtime": updated}
+                    if len(self._profile_runtime_idempotency) >= 1000:
+                        self._profile_runtime_idempotency.pop(next(iter(self._profile_runtime_idempotency)))
+                    self._profile_runtime_idempotency[idem] = {"fingerprint": fingerprint, "response": response}
+                    return 200, response
+            status, result = await asyncio.to_thread(apply)
+            return web.json_response(result, status=status)
+        except Exception:
+            logger.exception("POST profile runtime switch failed")
+            return web.json_response(_openai_error("Profile runtime switch is temporarily unavailable", code="profile_runtime_switch_unavailable"), status=503)
+
+    async def _kanban_api_call(self, request: "web.Request", operation, *args, **kwargs) -> "web.Response":
+        """Run one bounded Kanban API operation behind the normal bearer gate."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        # The listener normally cannot start without this key, but keep the
+        # route fail-closed for direct test/manual wiring as well.
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    "Kanban API requires API key authentication",
+                    code="kanban_api_auth_required",
+                ),
+                status=403,
+            )
+        try:
+            from gateway.kanban_api import KanbanApiError
+            payload = await asyncio.to_thread(operation, *args, **kwargs)
+        except KanbanApiError as exc:
+            return web.json_response(
+                _openai_error(exc.message, code=exc.code), status=exc.status
+            )
+        except Exception:
+            logger.exception("Kanban API operation failed")
+            return web.json_response(
+                _openai_error(
+                    "Kanban API is temporarily unavailable",
+                    err_type="server_error",
+                    code="kanban_api_unavailable",
+                ),
+                status=503,
+            )
+        return web.json_response(payload)
+
+    async def _handle_kanban_boards(self, request: "web.Request") -> "web.Response":
+        from gateway.kanban_api import list_boards
+        return await self._kanban_api_call(request, list_boards)
+
+    async def _handle_kanban_profiles(self, request: "web.Request") -> "web.Response":
+        from gateway.kanban_api import list_profiles
+        return await self._kanban_api_call(request, list_profiles, request.query.get("board"))
+
+    async def _handle_kanban_tasks(self, request: "web.Request") -> "web.Response":
+        from gateway.kanban_api import list_tasks
+        return await self._kanban_api_call(
+            request,
+            list_tasks,
+            request.query.get("board"),
+            status=request.query.get("status"),
+            assignee=request.query.get("assignee"),
+            limit=request.query.get("limit"),
+        )
+
+    async def _handle_kanban_task(self, request: "web.Request") -> "web.Response":
+        from gateway.kanban_api import get_task
+        return await self._kanban_api_call(
+            request, get_task, request.query.get("board"), request.match_info.get("task_id")
+        )
+
+    async def _handle_create_kanban_task(self, request: "web.Request") -> "web.Response":
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON", code="invalid_json"), status=400
+            )
+        from gateway.kanban_api import create_task
+        return await self._kanban_api_call(
+            request, create_task, request.query.get("board"), payload
+        )
+
+    async def _handle_kanban_action(self, request: "web.Request") -> "web.Response":
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON", code="invalid_json"), status=400
+            )
+        from gateway.kanban_api import mutate_task
+        return await self._kanban_api_call(
+            request,
+            mutate_task,
+            request.query.get("board"),
+            request.match_info.get("task_id"),
+            payload,
+        )
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -2081,7 +2834,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        return web.json_response({
+        payload = {
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
             "model": self._model_name,
@@ -2107,18 +2860,58 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
+                "run_event_replay": True,
+                "run_event_replay_version": 1,
+                "run_pending_action_status": True,
+                "run_pending_action_status_version": 1,
+                "run_runtime_identity": True,
+                "run_runtime_identity_version": 1,
                 "run_stop": True,
+                "run_inline_images": True,
+                "run_inline_images_version": 1,
+                "run_inline_images_data_urls_only": True,
+                "run_inline_images_max_count": RUN_INLINE_IMAGE_MAX_COUNT,
+                "run_inline_images_max_bytes": RUN_INLINE_IMAGE_MAX_BYTES,
                 "run_approval_response": True,
+                "run_approval_request_binding": True,
+                "run_approval_structured_preview": True,
+                "run_approval_preview_version": 1,
+                "run_clarification_response": True,
+                "run_clarification_request_binding": True,
+                "run_clarification_prompt_version": _RUN_CLARIFY_PROMPT_VERSION,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "clarification_events": True,
                 "session_resources": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "run_session_continuation": bool(self._api_key),
+                "run_session_continuation_version": RUN_SESSION_CONTINUATION_VERSION,
+                "run_session_continuation_exact_revision": True,
+                "run_session_continuation_stoppable": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
+                "profile_inventory": bool(self._api_key),
+                "profile_inventory_version": PROFILE_INVENTORY_VERSION,
+                "profile_inventory_complete": True,
+                "profile_inventory_requires_api_key": True,
+                "profile_runtime_inventory": bool(self._api_key),
+                "profile_runtime_inventory_version": PROFILE_RUNTIME_INVENTORY_VERSION,
+                "profile_runtime_inventory_complete": True,
+                "profile_runtime_inventory_requires_api_key": True,
+                "profile_runtime_switch": bool(self._api_key),
+                "profile_runtime_switch_version": PROFILE_RUNTIME_VERSION,
+                "profile_runtime_switch_revision_bound": True,
+                "profile_runtime_switch_idempotency": True,
+                "profile_runtime_switch_active_run_lock": True,
+                "kanban_api": bool(self._api_key),
+                "kanban_api_version": 1,
+                "kanban_api_revisioned": True,
+                "kanban_api_idempotency": True,
+                "kanban_api_requires_api_key": True,
                 "audio_api": False,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -2129,12 +2922,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
+                "profiles": {"method": "GET", "path": "/v1/profiles"},
+                "profile_runtimes": {
+                    "method": "GET",
+                    "path": "/v1/profile-runtimes",
+                },
+                "kanban_boards": {"method": "GET", "path": "/v1/kanban/boards"},
+                "kanban_profiles": {"method": "GET", "path": "/v1/kanban/profiles?board={board}"},
+                "kanban_tasks": {"method": "GET", "path": "/v1/kanban/tasks?board={board}"},
+                "kanban_task": {"method": "GET", "path": "/v1/kanban/tasks/{task_id}?board={board}"},
+                "kanban_task_create": {"method": "POST", "path": "/v1/kanban/tasks?board={board}"},
+                "kanban_task_action": {"method": "POST", "path": "/v1/kanban/tasks/{task_id}/actions?board={board}"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
+                "run_inline_images": {
+                    "method": "POST",
+                    "path": "/v1/runs",
+                    "version": 1,
+                    "input": "OpenAI content parts: input_text and input_image",
+                    "image_transport": "data_url_only",
+                    "mime_types": sorted(RUN_INLINE_IMAGE_MIME_TYPES),
+                    "max_count": RUN_INLINE_IMAGE_MAX_COUNT,
+                    "max_bytes_per_image": RUN_INLINE_IMAGE_MAX_BYTES,
+                },
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+                "run_clarification": {
+                    "method": "POST",
+                    "path": "/v1/runs/{run_id}/clarification",
+                },
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -2144,11 +2962,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_continuation": {
+                    "method": "GET",
+                    "path": "/v1/sessions/{session_id}/continuation",
+                },
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
-        })
+        }
+        if self._api_key:
+            payload["endpoints"]["profile_runtime"] = {"method": "GET", "path": "/v1/profiles/{profile_id}/runtime", "version": PROFILE_RUNTIME_VERSION}
+            payload["endpoints"]["profile_runtime_switch"] = {"method": "POST", "path": "/v1/profiles/{profile_id}/runtime/switch", "version": PROFILE_RUNTIME_VERSION}
+        return web.json_response(payload)
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -2497,6 +3323,101 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
+        })
+
+    async def _handle_session_continuation(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Issue a revision-bound descriptor for one stoppable Runs turn."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    "Session continuation requires API key authentication",
+                    code="session_continuation_auth_required",
+                ),
+                status=403,
+            )
+
+        session_id = request.match_info["session_id"]
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+        try:
+            snapshot = await asyncio.to_thread(
+                db.get_continuation_snapshot,
+                session_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to create continuation descriptor for session %s",
+                session_id,
+            )
+            return web.json_response(
+                _openai_error(
+                    "Session continuation is temporarily unavailable",
+                    code="session_continuation_unavailable",
+                ),
+                status=503,
+            )
+        if snapshot is None:
+            return web.json_response(
+                _openai_error(
+                    "Session not found",
+                    code="session_not_found",
+                ),
+                status=404,
+            )
+
+        resolved_id, conversation_history, message_ids = snapshot
+        from gateway.session import _is_path_unsafe
+
+        if (
+            not isinstance(resolved_id, str)
+            or not resolved_id
+            or len(resolved_id) > self._MAX_SESSION_HEADER_LEN
+            or re.search(r"[\r\n\x00]", resolved_id)
+            or _is_path_unsafe(resolved_id)
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Session cannot be represented by a continuation descriptor",
+                    code="session_continuation_unavailable",
+                ),
+                status=409,
+            )
+        try:
+            revision = _run_session_continuation_revision(
+                resolved_id,
+                conversation_history,
+                message_ids,
+            )
+        except (TypeError, ValueError):
+            logger.exception(
+                "Session %s could not be normalized for continuation",
+                resolved_id,
+            )
+            return web.json_response(
+                _openai_error(
+                    "Session continuation is unavailable for this history",
+                    code="session_continuation_unavailable",
+                ),
+                status=409,
+            )
+
+        return web.json_response({
+            "object": "hermes.session.continuation",
+            "version": RUN_SESSION_CONTINUATION_VERSION,
+            "session_id": resolved_id,
+            "revision": revision,
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
@@ -4839,46 +5760,671 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
+    def _emit_safe_run_delta_chunks(
+        self,
+        run_id: str,
+        text: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Publish boundary-complete text chunks after cross-delta buffering."""
+
+        last: Optional[Dict[str, Any]] = None
+        remaining = text
+        while remaining:
+            if len(remaining) <= 15_000:
+                chunk = remaining
+                remaining = ""
+            else:
+                boundary = max(
+                    remaining.rfind(character, 0, 15_001)
+                    for character in (" ", "\t", "\r", "\n")
+                )
+                if boundary < 0:
+                    chunk = "[redacted unbroken stream segment]"
+                    remaining = ""
+                else:
+                    chunk = remaining[:boundary + 1]
+                    remaining = remaining[boundary + 1:]
+            last = self._publish_run_event(
+                run_id,
+                {
+                    "event": "message.safe_delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": chunk,
+                },
+            )
+        return last
+
+    @staticmethod
+    def _normalized_credential_probe(value: str) -> str:
+        """Collapse padding that must not consume the lexical probe budget."""
+
+        return re.sub(r"[ \t_\"'-]+", "", value.lower())
+
+    @classmethod
+    def _credential_probe_state(cls, value: str) -> str:
+        """Classify a bounded same-line suffix as a credential marker probe."""
+
+        normalized = cls._normalized_credential_probe(value)
+        if not normalized:
+            return "none"
+        if any(
+            normalized.startswith(stem)
+            for stem in _RUN_CREDENTIAL_ASSIGNMENT_STEMS
+        ) or normalized.startswith("bearer"):
+            return "complete"
+        if any(
+            stem.startswith(normalized)
+            for stem in _RUN_CREDENTIAL_PROBE_STEMS
+        ):
+            return "partial"
+        return "none"
+
+    @classmethod
+    def _credential_probe_suffix(cls, value: str) -> tuple[str, str]:
+        """Return the longest word-boundary suffix that may be a marker."""
+
+        line = re.split(r"[\r\n]", value)[-1]
+        if _RUN_CREDENTIAL_VALUE_RE.search(line):
+            return "authorization:", "complete"
+        normalized = cls._normalized_credential_probe(line)
+        max_width = min(
+            len(normalized),
+            max(len(stem) for stem in _RUN_CREDENTIAL_PROBE_STEMS),
+        )
+        for width in range(max_width, 0, -1):
+            candidate = normalized[-width:]
+            state = cls._credential_probe_state(candidate)
+            if state != "none":
+                return candidate, state
+        return "", "none"
+
+    def _apply_run_credential_continuation(
+        self,
+        run_id: str,
+        incoming: str,
+    ) -> str:
+        """Carry partial credential markers safely across lifecycle events."""
+
+        if run_id in self._run_redact_until_newline:
+            newline = next(
+                (
+                    index
+                    for index, character in enumerate(incoming)
+                    if character in "\r\n"
+                ),
+                None,
+            )
+            if newline is None:
+                return ""
+            self._run_redact_until_newline.discard(run_id)
+            return incoming[newline:]
+
+        prefix = self._run_credential_prefixes.pop(run_id, "")
+        if not prefix:
+            return incoming
+        newline = next(
+            (
+                index
+                for index, character in enumerate(incoming)
+                if character in "\r\n"
+            ),
+            None,
+        )
+        same_line = incoming if newline is None else incoming[:newline]
+        combined = prefix + same_line
+        state = self._credential_probe_state(combined)
+        if state == "partial" and newline is None:
+            self._run_credential_prefixes[run_id] = (
+                self._normalized_credential_probe(combined)[
+                    -_RUN_CREDENTIAL_PROBE_CHARS:
+                ]
+            )
+            return incoming
+        if state != "complete":
+            return incoming
+        if (
+            newline is not None
+            and not self._normalized_credential_probe(same_line)
+        ):
+            return incoming
+
+        if newline is None:
+            self._run_redact_until_newline.add(run_id)
+            return "[credential removed]"
+        return "[credential removed]" + incoming[newline:]
+
+    def _remember_run_credential_probe(self, run_id: str, value: str) -> None:
+        """Carry normalized marker state across any public emission boundary."""
+
+        probe, probe_state = self._credential_probe_suffix(value)
+        if probe_state == "partial":
+            self._run_credential_prefixes[run_id] = probe
+        elif probe_state == "complete":
+            self._run_redact_until_newline.add(run_id)
+
+    def _prepare_run_delta_emission(self, run_id: str, value: str) -> str:
+        """Advance stream-redaction state exactly once for emitted text."""
+
+        had_state = (
+            run_id in self._run_redact_until_newline
+            or run_id in self._run_credential_prefixes
+        )
+        safe = self._apply_run_credential_continuation(run_id, value)
+        if (
+            not had_state
+            or (
+                run_id not in self._run_redact_until_newline
+                and run_id not in self._run_credential_prefixes
+            )
+        ):
+            self._remember_run_credential_probe(run_id, value)
+        return safe
+
+    def _buffer_run_delta(
+        self,
+        run_id: str,
+        delta: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Withhold a token tail so secrets split across deltas cannot escape."""
+
+        if isinstance(delta, str):
+            incoming = delta
+        else:
+            incoming = str(delta or "")
+        if len(incoming) > _RUN_DELTA_MAX_UNBROKEN_CHARS:
+            incoming = "[redacted oversized stream segment]"
+        buffer = self._run_delta_buffers.get(run_id, "") + incoming
+        emit_until = len(buffer) - _RUN_DELTA_TAIL_CHARS
+        if emit_until <= 0:
+            self._run_delta_buffers[run_id] = buffer
+            return None
+        boundary = max(
+            buffer.rfind(character, 0, emit_until + 1)
+            for character in (" ", "\t", "\r", "\n")
+        )
+        if boundary < 0:
+            if len(buffer) > _RUN_DELTA_MAX_UNBROKEN_CHARS:
+                self._run_delta_buffers[run_id] = ""
+                return self._emit_safe_run_delta_chunks(
+                    run_id,
+                    "[redacted unbroken stream segment]",
+                )
+            self._run_delta_buffers[run_id] = buffer
+            return None
+        ready = buffer[:boundary + 1]
+        incomplete = _RUN_INCOMPLETE_CREDENTIAL_RE.search(ready)
+        if incomplete is not None:
+            if len(buffer) > _RUN_DELTA_MAX_UNBROKEN_CHARS:
+                self._run_delta_buffers[run_id] = ""
+                self._run_redact_until_newline.add(run_id)
+                return self._emit_safe_run_delta_chunks(
+                    run_id,
+                    ready[:incomplete.start()] + "[credential removed]",
+                )
+            self._run_delta_buffers[run_id] = buffer
+            return None
+        self._run_delta_buffers[run_id] = buffer[boundary + 1:]
+        ready = self._prepare_run_delta_emission(run_id, ready)
+        return self._emit_safe_run_delta_chunks(run_id, ready)
+
+    def _flush_run_delta(self, run_id: str) -> Optional[Dict[str, Any]]:
+        remaining = self._run_delta_buffers.pop(run_id, "")
+        remaining = self._prepare_run_delta_emission(run_id, remaining)
+        if not remaining:
+            return None
+        incomplete = _RUN_INCOMPLETE_CREDENTIAL_RE.search(remaining)
+        if incomplete is not None:
+            remaining = (
+                remaining[:incomplete.start()]
+                + "[credential removed]"
+            )
+            self._run_redact_until_newline.add(run_id)
+        if (
+            len(remaining) > _RUN_DELTA_MAX_UNBROKEN_CHARS
+            and not any(character.isspace() for character in remaining)
+        ):
+            remaining = "[redacted unbroken stream segment]"
+        return self._emit_safe_run_delta_chunks(run_id, remaining)
+
+    @staticmethod
+    def _normalize_public_run_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return the only schema eligible for Runs replay and SSE egress."""
+
+        event_type = event.get("event")
+        run_id = event.get("run_id")
+        if (
+            not isinstance(event_type, str)
+            or not isinstance(run_id, str)
+            or not run_id
+            or len(run_id) > 128
+        ):
+            return None
+        raw_timestamp = event.get("timestamp")
+        if raw_timestamp is not None and not isinstance(raw_timestamp, (int, float)):
+            return None
+        published: Dict[str, Any] = {
+            "event": event_type,
+            "run_id": run_id,
+            "timestamp": float(raw_timestamp or time.time()),
+        }
+        if event_type == "message.safe_delta":
+            published["event"] = "message.delta"
+            published["delta"] = _bounded_public_run_text(
+                event.get("delta"), limit=16_000
+            )
+        elif event_type in {"tool.started", "tool.completed"}:
+            tool = event.get("tool")
+            if (
+                not isinstance(tool, str)
+                or re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", tool) is None
+            ):
+                return None
+            published["tool"] = tool
+        elif event_type == "reasoning.available":
+            pass
+        elif event_type == "approval.request":
+            request_id = event.get("request_id")
+            preview = event.get("preview")
+            choices = event.get("choices")
+            if (
+                not isinstance(request_id, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", request_id)
+                is None
+                or type(preview) is not dict
+                or preview.get("version") != 1
+                or preview.get("category") not in _APPROVAL_PREVIEW_COPY
+                or not isinstance(preview.get("risk_labels"), list)
+                or not isinstance(choices, list)
+            ):
+                return None
+            title, summary = _APPROVAL_PREVIEW_COPY[preview["category"]]
+            safe_choices = [
+                choice
+                for choice in ("once", "session", "always", "deny")
+                if choice in choices
+            ]
+            if not {"once", "deny"}.issubset(set(safe_choices)):
+                return None
+            published.update({
+                "request_id": request_id,
+                "preview": {
+                    "version": 1,
+                    "category": preview["category"],
+                    "title": title,
+                    "summary": summary,
+                    "risk_labels": [
+                        _bounded_public_run_text(label, limit=120)
+                        for label in preview["risk_labels"][:8]
+                        if isinstance(label, str) and label
+                    ],
+                },
+                "choices": safe_choices,
+            })
+        elif event_type == "clarify.request":
+            request_id = event.get("request_id")
+            prompt = event.get("prompt")
+            if (
+                not isinstance(request_id, str)
+                or _RUN_CLARIFY_REQUEST_ID_RE.fullmatch(request_id) is None
+                or type(prompt) is not dict
+                or prompt.get("version") != 1
+                or prompt.get("type") not in {"choice", "text"}
+            ):
+                return None
+            safe_prompt: Dict[str, Any] = {
+                "version": 1,
+                "type": prompt["type"],
+                "question": _bounded_public_run_text(
+                    prompt.get("question"), limit=_RUN_CLARIFY_MAX_QUESTION_CHARS
+                ),
+            }
+            if not safe_prompt["question"].strip():
+                return None
+            if prompt["type"] == "choice":
+                choices = prompt.get("choices")
+                if not isinstance(choices, list) or not (1 <= len(choices) <= 4):
+                    return None
+                safe_prompt["choices"] = []
+                for choice in choices:
+                    if (
+                        type(choice) is not dict
+                        or re.fullmatch(r"choice-[1-4]", str(choice.get("id") or ""))
+                        is None
+                    ):
+                        return None
+                    label = _bounded_public_run_text(
+                        choice.get("label"), limit=_RUN_CLARIFY_MAX_CHOICE_CHARS
+                    )
+                    if not label.strip():
+                        return None
+                    safe_prompt["choices"].append({
+                        "id": choice["id"],
+                        "label": label,
+                    })
+            published.update({"request_id": request_id, "prompt": safe_prompt})
+        elif event_type == "approval.responded":
+            request_id = event.get("request_id")
+            if (
+                (
+                    request_id is not None
+                    and (
+                        not isinstance(request_id, str)
+                        or re.fullmatch(
+                            r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}",
+                            request_id,
+                        )
+                        is None
+                    )
+                )
+                or event.get("choice") not in {"once", "session", "always", "deny"}
+                or type(event.get("resolved")) is not int
+                or event["resolved"] < 1
+            ):
+                return None
+            if request_id is not None:
+                published["request_id"] = request_id
+            published.update({
+                "choice": event["choice"],
+                "resolved": event["resolved"],
+            })
+        elif event_type == "clarify.responded":
+            request_id = event.get("request_id")
+            response_type = event.get("type")
+            if (
+                not isinstance(request_id, str)
+                or _RUN_CLARIFY_REQUEST_ID_RE.fullmatch(request_id) is None
+                or response_type not in {"choice", "text"}
+            ):
+                return None
+            published.update({"request_id": request_id, "type": response_type})
+            if response_type == "choice":
+                choice_id = event.get("choice_id")
+                if re.fullmatch(r"choice-[1-4]", str(choice_id or "")) is None:
+                    return None
+                published["choice_id"] = choice_id
+        elif event_type == "runtime.updated":
+            provider = str(event.get("provider") or "")
+            model = str(event.get("model") or "")
+            if not _safe_runtime_identity(provider, model, allow_empty=False):
+                return None
+            published.update({"provider": provider, "model": model})
+        elif event_type == "run.cancelled":
+            pass
+        elif event_type == "run.failed":
+            raw_error = str(event.get("error") or "")
+            published.update({
+                "error": _bounded_public_run_text(raw_error, limit=2_000),
+                "error_complete": len(raw_error) <= 2_000,
+            })
+        elif event_type == "run.completed":
+            raw_output = str(event.get("output") or "")
+            published.update({
+                "output": _bounded_public_run_text(raw_output, limit=16_000),
+                "output_complete": len(raw_output) <= 16_000,
+                "output_chars": min(len(raw_output), 200_000),
+            })
+            usage = event.get("usage")
+            if type(usage) is dict:
+                safe_usage: Dict[str, int] = {}
+                for key in ("input_tokens", "output_tokens", "total_tokens"):
+                    value = usage.get(key)
+                    if type(value) is not int or not (0 <= value <= 10**9):
+                        return None
+                    safe_usage[key] = value
+                published["usage"] = safe_usage
+        else:
+            return None
+        encoded = json.dumps(
+            published, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return published if len(encoded) <= _RUN_EVENT_MAX_BYTES else None
+
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
-        now = time.time()
         current = self._run_statuses.get(run_id, {})
-        current.update({
-            "object": "hermes.run",
-            "run_id": run_id,
-            "status": status,
-            "updated_at": now,
-        })
-        current.setdefault("created_at", fields.pop("created_at", now))
-        current.update(fields)
-        self._run_statuses[run_id] = current
-        return current
+        profile_id = fields.get("profile_id") or current.get("profile_id") or "default"
+        with self._profile_runtime_lock(profile_id):
+            now = time.time()
+            if "output" in fields:
+                fields["output"] = _bounded_public_run_text(
+                    fields["output"], limit=200_000
+                )
+            if "error" in fields:
+                fields["error"] = _bounded_public_run_text(
+                    fields["error"], limit=2_000
+                )
+            current.update({
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": status,
+                "updated_at": now,
+            })
+            current.setdefault("created_at", fields.pop("created_at", now))
+            if fields.get("pending_action", object()) is None:
+                current.pop("pending_action", None)
+                fields.pop("pending_action", None)
+            current.update(fields)
+            self._run_statuses[run_id] = current
+            return current
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+    def _publish_run_event(self, run_id: str, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Sequence, retain, and broadcast one bounded public Runs event."""
+        if run_id not in self._run_streams:
+            return None
+        event_type = event.get("event")
+        if event_type == "message.delta":
+            return self._buffer_run_delta(run_id, event.get("delta"))
+        if event_type != "message.safe_delta":
+            self._flush_run_delta(run_id)
+        normalized = self._normalize_public_run_event(event)
+        if normalized is None:
+            logger.warning(
+                "[api_server] dropped invalid public run event %r for %s",
+                event.get("event"),
+                run_id,
+            )
+            return None
+        sequence = self._run_event_sequences.get(run_id, 0) + 1
+        self._run_event_sequences[run_id] = sequence
+        published = dict(normalized)
+        published["sequence"] = sequence
+        published["event_id"] = sequence
+        log = self._run_event_logs.setdefault(
+            run_id, deque(maxlen=_RUN_EVENT_RETENTION)
+        )
+        event_bytes = len(json.dumps(
+            published, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8"))
+        retained_bytes = self._run_event_log_bytes.get(run_id, 0)
+        while log and (
+            len(log) >= _RUN_EVENT_RETENTION
+            or retained_bytes + event_bytes > _RUN_EVENT_JOURNAL_MAX_BYTES
+        ):
+            removed = log.popleft()
+            retained_bytes -= len(json.dumps(
+                removed, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8"))
+        log.append(published)
+        self._run_event_log_bytes[run_id] = max(0, retained_bytes) + event_bytes
+
+        compatibility_queue = self._run_streams.get(run_id)
+        if compatibility_queue is not None:
+            try:
+                if compatibility_queue.full():
+                    compatibility_queue.get_nowait()
+                compatibility_queue.put_nowait(published)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+        for subscriber in tuple(self._run_subscriber_queues.get(run_id, ())):
+            try:
+                subscriber.put_nowait(published)
+            except asyncio.QueueFull:
+                # A subscriber that cannot keep up must reconnect with its last
+                # verified cursor; never discard journal ordering globally.
+                self._force_queue_sentinel(subscriber)
+                self._run_subscriber_queues.get(run_id, set()).discard(subscriber)
+        return published
+
+    @staticmethod
+    def _force_queue_sentinel(stream: "asyncio.Queue[Optional[Dict[str, Any]]]") -> None:
+        """Wake one stream even when its private bounded queue is saturated."""
+        while True:
+            try:
+                stream.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        stream.put_nowait(None)
+
+    @staticmethod
+    def _enqueue_queue_sentinel(stream: "asyncio.Queue[Optional[Dict[str, Any]]]") -> None:
+        """Close after queued events without creating a sequence gap."""
+        if stream.full():
+            # A terminal event already closes SSE readers. If a non-terminal
+            # subscriber is saturated, publish forced it onto the clean
+            # reconnect path instead of leaving a gapped suffix.
+            return
+        stream.put_nowait(None)
+
+    def _close_run_event_stream(self, run_id: str) -> None:
+        compatibility_queue = self._run_streams.get(run_id)
+        if compatibility_queue is not None:
+            self._enqueue_queue_sentinel(compatibility_queue)
+        for subscriber in tuple(self._run_subscriber_queues.get(run_id, ())):
+            self._enqueue_queue_sentinel(subscriber)
+
+    @staticmethod
+    def _runtime_identity(agent: Any) -> Optional[Dict[str, str]]:
+        provider = str(getattr(agent, "provider", "") or "").strip()
+        model = str(getattr(agent, "model", "") or "").strip()
+        if not _safe_runtime_identity(provider, model, allow_empty=False):
+            return None
+        return {"provider": provider, "model": model}
+
+    def _publish_runtime_if_changed(
+        self,
+        run_id: str,
+        agent: Any,
+        runtime_ref: Dict[str, Any],
+    ) -> None:
+        runtime = self._runtime_identity(agent)
+        if runtime is None or runtime == runtime_ref.get("last"):
+            return
+        runtime_ref["last"] = dict(runtime)
+        self._set_run_status(
+            run_id,
+            self._run_statuses.get(run_id, {}).get("status", "running"),
+            runtime=dict(runtime),
+            last_event="runtime.updated",
+        )
+        self._publish_run_event(
+            run_id,
+            {
+                "event": "runtime.updated",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                **runtime,
+            },
+        )
+
+    def _current_pending_action(self, run_id: str) -> Optional[Dict[str, Any]]:
+        approvals = self._run_pending_approvals.get(run_id) or {}
+        if approvals:
+            return dict(next(iter(approvals.values())))
+        clarifications = self._run_pending_clarifications.get(run_id) or {}
+        if clarifications:
+            return dict(next(iter(clarifications.values())))
+        return None
+
+    def _register_run_approval_event(
+        self,
+        run_id: str,
+        approval_session_key: str,
+        source: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Mirror only an exact approval that remains pending in the core."""
+
+        source = dict(source or {})
+        request_id = str(source.get("request_id") or "")
+        from tools.approval import is_gateway_approval_pending
+
+        if (
+            run_id in self._stopping_run_ids
+            or not is_gateway_approval_pending(
+                approval_session_key,
+                request_id,
+            )
+        ):
+            return None
+        choices = _approval_event_choices(
+            smart_denied=bool(source.get("smart_denied")),
+            allow_permanent=source.get("allow_permanent") is not False,
+        )
+        event = {
+            "event": "approval.request",
+            "run_id": run_id,
+            "request_id": request_id,
+            "timestamp": time.time(),
+            "preview": _safe_approval_preview(source),
+            "choices": choices,
+        }
+        action = {
+            "version": 1,
+            "kind": "approval",
+            "request_id": request_id,
+            "preview": dict(event["preview"]),
+            "choices": list(choices),
+        }
+        self._run_pending_approvals.setdefault(
+            run_id, {}
+        )[request_id] = action
+        self._set_run_status(
+            run_id,
+            "waiting_for_approval",
+            last_event="approval.request",
+            pending_action=dict(action),
+        )
+        return self._publish_run_event(run_id, event)
+
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        runtime_ref: Optional[Dict[str, Any]] = None,
+    ):
+        """Return a tool callback that publishes retained structured events."""
+        runtime_ref = runtime_ref if runtime_ref is not None else {}
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
                 self._run_statuses.get(run_id, {}).get("status", "running"),
                 last_event=event.get("event"),
             )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                loop.call_soon_threadsafe(self._publish_run_event, run_id, event)
             except Exception:
                 pass
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
+            agent = runtime_ref.get("agent")
+            if agent is not None:
+                try:
+                    loop.call_soon_threadsafe(
+                        self._publish_runtime_if_changed,
+                        run_id,
+                        agent,
+                        runtime_ref,
+                    )
+                except Exception:
+                    pass
             if event_type == "tool.started":
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
-                    "preview": preview,
                 })
             elif event_type == "tool.completed":
                 _push({
@@ -4894,7 +6440,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     "event": "reasoning.available",
                     "run_id": run_id,
                     "timestamp": ts,
-                    "text": preview or "",
                 })
             # _thinking and subagent_progress are intentionally not forwarded
 
@@ -4918,23 +6463,199 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object"),
+                status=400,
+            )
 
         raw_input = body.get("input")
-        if not raw_input:
+        if raw_input is None or raw_input == "" or raw_input == []:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
-
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
-            return web.json_response(_openai_error("No user message found in input"), status=400)
+        try:
+            user_message = _normalize_run_input(raw_input)
+        except ValueError as exc:
+            code, _, message = str(exc).partition(":")
+            return web.json_response(
+                _openai_error(message or "The Runs input is invalid", code=code or "invalid_run_input"),
+                status=400,
+            )
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
 
+        continued_session_id: Optional[str] = None
+        continued_history: Optional[List[Dict[str, Any]]] = None
+        continuation_claim_id: Optional[str] = None
+        continuation_claim_key: Optional[tuple[Optional[str], str]] = None
+        raw_continuation = body.get("continuation")
+        if raw_continuation is not None:
+            if not self._api_key:
+                return web.json_response(
+                    _openai_error(
+                        "Session continuation requires API key authentication",
+                        code="session_continuation_auth_required",
+                    ),
+                    status=403,
+                )
+            if not isinstance(raw_continuation, dict):
+                return web.json_response(
+                    _openai_error(
+                        "'continuation' must be an object",
+                        code="invalid_session_continuation",
+                    ),
+                    status=400,
+                )
+            expected_fields = {"version", "session_id", "revision"}
+            if set(raw_continuation) != expected_fields:
+                return web.json_response(
+                    _openai_error(
+                        "'continuation' must contain exactly version, session_id, and revision",
+                        code="invalid_session_continuation",
+                    ),
+                    status=400,
+                )
+            if any(
+                field in body
+                for field in (
+                    "session_id",
+                    "conversation_history",
+                    "previous_response_id",
+                )
+            ) or (isinstance(raw_input, list) and len(raw_input) > 1):
+                return web.json_response(
+                    _openai_error(
+                        "Continuation cannot be combined with session_id or client-supplied history",
+                        code="ambiguous_session_continuation",
+                    ),
+                    status=400,
+                )
+
+            continuation_version = raw_continuation.get("version")
+            continuation_session_id = raw_continuation.get("session_id")
+            continuation_revision = raw_continuation.get("revision")
+            from gateway.session import _is_path_unsafe
+
+            if (
+                not isinstance(continuation_version, int)
+                or isinstance(continuation_version, bool)
+                or continuation_version != RUN_SESSION_CONTINUATION_VERSION
+                or not isinstance(continuation_session_id, str)
+                or not continuation_session_id
+                or len(continuation_session_id) > self._MAX_SESSION_HEADER_LEN
+                or re.search(r"[\r\n\x00]", continuation_session_id)
+                or _is_path_unsafe(continuation_session_id)
+                or not isinstance(continuation_revision, str)
+                or RUN_SESSION_CONTINUATION_REVISION_RE.fullmatch(
+                    continuation_revision
+                )
+                is None
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Invalid session continuation descriptor",
+                        code="invalid_session_continuation",
+                    ),
+                    status=400,
+                )
+
+            db = await self._ensure_session_db_async()
+            if db is None:
+                return web.json_response(
+                    _openai_error(
+                        "Session database unavailable",
+                        code="session_db_unavailable",
+                    ),
+                    status=503,
+                )
+            continuation_claim_key = (
+                _api_request_profile.get(),
+                continuation_session_id,
+            )
+            if continuation_claim_key in self._active_continuation_sessions:
+                return web.json_response(
+                    _openai_error(
+                        "Session continuation already has an active run",
+                        code="session_continuation_active",
+                    ),
+                    status=409,
+                )
+            continuation_claim_id = f"checking_{uuid.uuid4().hex}"
+            self._active_continuation_sessions[
+                continuation_claim_key
+            ] = continuation_claim_id
+            try:
+                try:
+                    snapshot = await asyncio.to_thread(
+                        db.get_continuation_snapshot,
+                        continuation_session_id,
+                    )
+                except Exception:
+                    logger.exception("Failed to verify a Runs continuation descriptor")
+                    return web.json_response(
+                        _openai_error(
+                            "Session continuation is temporarily unavailable",
+                            code="session_continuation_unavailable",
+                        ),
+                        status=503,
+                    )
+                if snapshot is None:
+                    return web.json_response(
+                        _openai_error(
+                            "Session continuation is no longer current",
+                            code="session_continuation_changed",
+                        ),
+                        status=409,
+                    )
+                resolved_id, snapshot_history, snapshot_message_ids = snapshot
+                try:
+                    current_revision = _run_session_continuation_revision(
+                        resolved_id,
+                        snapshot_history,
+                        snapshot_message_ids,
+                    )
+                except (TypeError, ValueError):
+                    return web.json_response(
+                        _openai_error(
+                            "Session continuation is unavailable for this history",
+                            code="session_continuation_unavailable",
+                        ),
+                        status=409,
+                    )
+                if (
+                    resolved_id != continuation_session_id
+                    or not hmac.compare_digest(
+                        current_revision,
+                        continuation_revision,
+                    )
+                ):
+                    return web.json_response(
+                        _openai_error(
+                            "Session continuation is no longer current",
+                            code="session_continuation_changed",
+                        ),
+                        status=409,
+                    )
+                continued_session_id = resolved_id
+                continued_history = snapshot_history
+            finally:
+                if (
+                    continued_session_id is None
+                    and self._active_continuation_sessions.get(
+                        continuation_claim_key
+                    )
+                    == continuation_claim_id
+                ):
+                    self._active_continuation_sessions.pop(
+                        continuation_claim_key,
+                        None,
+                    )
+
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
+        conversation_history: List[Dict[str, Any]] = list(continued_history or [])
         raw_history = body.get("conversation_history")
-        if raw_history:
+        if continued_history is None and raw_history:
             if not isinstance(raw_history, list):
                 return web.json_response(
                     _openai_error("'conversation_history' must be an array of message objects"),
@@ -4951,7 +6672,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
-        if not conversation_history and previous_response_id:
+        if continued_history is None and not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
@@ -4962,7 +6683,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # When input is a multi-message array, extract all but the last
         # message as conversation history (the last becomes user_message).
         # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+        if (
+            continued_history is None
+            and not conversation_history
+            and isinstance(raw_input, list)
+            and len(raw_input) > 1
+        ):
             for msg in raw_input[:-1]:
                 if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
                     content = msg["content"]
@@ -4975,27 +6701,64 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
+        session_id = (
+            continued_session_id
+            or body.get("session_id")
+            or stored_session_id
+            or run_id
+        )
+        if continued_session_id is not None:
+            # The verification reservation remains owned, and no await occurs
+            # while it is transferred to the newly allocated run ID.
+            if (
+                self._active_continuation_sessions.get(continuation_claim_key)
+                != continuation_claim_id
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Session continuation claim was lost",
+                        code="session_continuation_changed",
+                    ),
+                    status=409,
+                )
+            self._active_continuation_sessions[continuation_claim_key] = run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
         # concurrent runs can intentionally share them, and resolving an
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
+        clarify_session_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue(
+            maxsize=_RUN_EVENT_RETENTION
+        )
         created_at = time.time()
         self._run_streams[run_id] = q
+        self._run_event_logs[run_id] = deque(maxlen=_RUN_EVENT_RETENTION)
+        self._run_event_log_bytes[run_id] = 0
+        self._run_delta_buffers[run_id] = ""
+        self._run_redact_until_newline.discard(run_id)
+        self._run_credential_prefixes.pop(run_id, None)
+        self._run_event_sequences[run_id] = 0
+        self._run_subscriber_queues[run_id] = set()
+        self._run_pending_approvals[run_id] = {}
+        self._run_pending_clarifications[run_id] = {}
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
+        self._run_clarify_sessions[run_id] = clarify_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        runtime_ref: Dict[str, Any] = {"agent": None, "last": None}
+        event_cb = self._make_run_event_callback(run_id, loop, runtime_ref)
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
             if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+                if event is None:
+                    self._close_run_event_stream(run_id)
+                else:
+                    self._publish_run_event(run_id, event)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -5018,7 +6781,13 @@ class APIServerAdapter(BasePlatformAdapter):
             "queued",
             created_at=created_at,
             session_id=session_id,
+            profile_id=self._effective_api_profile(),
             model=body.get("model", self._model_name),
+            **(
+                {"continuation_version": RUN_SESSION_CONTINUATION_VERSION}
+                if continued_session_id is not None
+                else {}
+            ),
         )
 
         # Per-client model routing for /v1/runs (see model_routes).
@@ -5042,6 +6811,88 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
+                def _clarify_callback(question: str, choices) -> str:
+                    from tools import clarify_gateway
+
+                    safe_question = _bounded_public_run_text(
+                        question, limit=_RUN_CLARIFY_MAX_QUESTION_CHARS
+                    )
+                    safe_choices = None
+                    if choices:
+                        safe_choices = [
+                            _bounded_public_run_text(
+                                choice, limit=_RUN_CLARIFY_MAX_CHOICE_CHARS
+                            )
+                            for choice in list(choices)[:4]
+                        ]
+                    request_id = f"clarify_{uuid.uuid4().hex}"
+                    clarify_gateway.register(
+                        clarify_id=request_id,
+                        session_key=clarify_session_key,
+                        question=safe_question,
+                        choices=safe_choices,
+                    )
+                    prompt: Dict[str, Any] = {
+                        "version": _RUN_CLARIFY_PROMPT_VERSION,
+                        "type": "choice" if safe_choices else "text",
+                        "question": safe_question,
+                    }
+                    if safe_choices:
+                        prompt["choices"] = [
+                            {"id": f"choice-{index}", "label": label}
+                            for index, label in enumerate(safe_choices, start=1)
+                        ]
+
+                    def _publish_clarify() -> None:
+                        if (
+                            run_id in self._stopping_run_ids
+                            or clarify_gateway.get_pending_by_id(
+                                request_id,
+                                session_key=clarify_session_key,
+                            )
+                            is None
+                        ):
+                            return
+                        if self._run_streams.get(run_id) is not q:
+                            clarify_gateway.clear_session(clarify_session_key)
+                            return
+                        action = {
+                            "version": 1,
+                            "kind": "clarification",
+                            "request_id": request_id,
+                            "prompt": dict(prompt),
+                        }
+                        self._run_pending_clarifications.setdefault(
+                            run_id, {}
+                        )[request_id] = action
+                        self._set_run_status(
+                            run_id,
+                            "waiting_for_clarification",
+                            last_event="clarify.request",
+                            pending_action=dict(action),
+                        )
+                        _put_event_if_active({
+                            "event": "clarify.request",
+                            "run_id": run_id,
+                            "request_id": request_id,
+                            "timestamp": time.time(),
+                            "prompt": prompt,
+                        })
+
+                    try:
+                        loop.call_soon_threadsafe(_publish_clarify)
+                    except RuntimeError:
+                        clarify_gateway.clear_session(clarify_session_key)
+                        return "[clarify prompt could not be delivered]"
+                    timeout = clarify_gateway.get_clarify_timeout()
+                    response = clarify_gateway.wait_for_response(
+                        request_id,
+                        timeout=float(timeout),
+                    )
+                    if not response:
+                        return f"[user did not respond within {int(timeout / 60)}m]"
+                    return response
+
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -5050,36 +6901,33 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         route=route,
+                        clarify_callback=_clarify_callback,
+                        enable_clarify=True,
                     )
+                runtime_ref["agent"] = agent
                 self._active_run_agents[run_id] = agent
+                self._publish_runtime_if_changed(run_id, agent, runtime_ref)
+
+                def _register_approval_event(source: Dict[str, Any]) -> None:
+                    self._register_run_approval_event(
+                        run_id,
+                        approval_session_key,
+                        source,
+                    )
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
+                    from gateway.run import _redact_approval_command
 
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
+                    source = dict(approval_data or {})
+                    source["command"] = _redact_approval_command(
+                        source.get("command")
                     )
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception:
+                        loop.call_soon_threadsafe(
+                            _register_approval_event,
+                            source,
+                        )
+                    except RuntimeError:
                         pass
 
                 def _run_sync():
@@ -5131,6 +6979,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                self._publish_runtime_if_changed(run_id, agent, runtime_ref)
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -5141,6 +6990,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
+                        pending_action=None,
                     )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
@@ -5158,6 +7008,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "failed",
                         error=error_msg,
                         last_event="run.failed",
+                        pending_action=None,
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -5174,12 +7025,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         output=final_response,
                         usage=usage,
                         last_event="run.completed",
+                        pending_action=None,
                     )
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
                     "cancelled",
                     last_event="run.cancelled",
+                    pending_action=None,
                 )
                 try:
                     _put_event_if_active({
@@ -5197,6 +7050,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "failed",
                     error=_redact_api_error_text(exc),
                     last_event="run.failed",
+                    pending_action=None,
                 )
                 try:
                     _put_event_if_active({
@@ -5227,6 +7081,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                try:
+                    from tools.clarify_gateway import clear_session
+
+                    clear_session(clarify_session_key)
+                except Exception:
+                    pass
+                self._run_clarify_sessions.pop(run_id, None)
+                self._run_pending_approvals.pop(run_id, None)
+                self._run_pending_clarifications.pop(run_id, None)
+                if (
+                    continued_session_id is not None
+                    and self._active_continuation_sessions.get(
+                        continuation_claim_key
+                    )
+                    == run_id
+                ):
+                    self._active_continuation_sessions.pop(
+                        continuation_claim_key,
+                        None,
+                    )
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
@@ -5264,7 +7138,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+        """Replay retained events, then follow an independent live SSE stream."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -5279,8 +7153,56 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
+        raw_cursor = str(request.headers.get("Last-Event-ID") or "").strip()
+        cursor_supplied = bool(raw_cursor)
+        if cursor_supplied and _RUN_EVENT_CURSOR_RE.fullmatch(raw_cursor) is None:
+            return web.json_response(
+                _openai_error(
+                    "Invalid run event cursor",
+                    code="run_event_cursor_invalid",
+                ),
+                status=400,
+            )
+        cursor = int(raw_cursor or 0)
+        log = self._run_event_logs.get(run_id)
+        if log is None:
+            return web.json_response(
+                _openai_error(
+                    "Run event replay is unavailable",
+                    code="run_event_replay_unavailable",
+                ),
+                status=409,
+            )
+        latest = self._run_event_sequences.get(run_id, 0)
+        oldest = int(log[0]["sequence"]) if log else latest + 1
+        if cursor > latest:
+            return web.json_response(
+                _openai_error(
+                    "Run event cursor is ahead of the current stream",
+                    code="run_event_cursor_invalid",
+                ),
+                status=409,
+            )
+        if cursor_supplied and log and cursor < oldest - 1:
+            return web.json_response(
+                _openai_error(
+                    "Run event cursor is no longer retained",
+                    code="run_event_cursor_expired",
+                ),
+                status=409,
+            )
+
+        subscriber: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue(
+            maxsize=_RUN_EVENT_RETENTION
+        )
+        subscribers = self._run_subscriber_queues.setdefault(run_id, set())
+        subscribers.add(subscriber)
         self._run_stream_subscribers.add(run_id)
+        replay = [
+            dict(event)
+            for event in log
+            if int(event.get("sequence", 0)) > cursor
+        ]
 
         response = web.StreamResponse(
             status=200,
@@ -5292,25 +7214,51 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         await response.prepare(request)
 
+        last_sent = cursor
+        terminal_events = {"run.completed", "run.failed", "run.cancelled"}
+
+        async def _write_event(event: Dict[str, Any]) -> bool:
+            nonlocal last_sent
+            sequence = int(event.get("sequence", 0))
+            if sequence <= last_sent:
+                return False
+            payload = json.dumps(event, separators=(",", ":"), ensure_ascii=False)
+            await response.write(
+                f"id: {sequence}\ndata: {payload}\n\n".encode("utf-8")
+            )
+            last_sent = sequence
+            return event.get("event") in terminal_events
+
         try:
+            for event in replay:
+                if await _write_event(event):
+                    await response.write(b": stream closed\n\n")
+                    return response
+            status = self._run_statuses.get(run_id, {}).get("status")
+            if (
+                status in {"completed", "failed", "cancelled"}
+                and subscriber.empty()
+            ):
+                await response.write(b": stream closed\n\n")
+                return response
             while True:
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    event = await asyncio.wait_for(subscriber.get(), timeout=30.0)
                 except asyncio.TimeoutError:
                     await response.write(b": keepalive\n\n")
                     continue
                 if event is None:
-                    # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
-                payload = f"data: {json.dumps(event)}\n\n"
-                await response.write(payload.encode())
+                if await _write_event(event):
+                    await response.write(b": stream closed\n\n")
+                    break
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
-            self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            subscribers.discard(subscriber)
+            if not subscribers:
+                self._run_stream_subscribers.discard(run_id)
 
         return response
 
@@ -5347,6 +7295,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        request_id = body.get("request_id") if "request_id" in body else None
+        if request_id is not None:
+            from tools.approval import is_valid_approval_request_id
+
+        if request_id is not None and not is_valid_approval_request_id(request_id):
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval request_id",
+                    code="invalid_approval_request_id",
+                ),
+                status=400,
+            )
+
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
             return web.json_response(
@@ -5361,46 +7322,231 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
-        try:
-            from tools.approval import resolve_gateway_approval
-
-            resolved = resolve_gateway_approval(
-                approval_session_key,
-                choice,
-                resolve_all=resolve_all,
+        if request_id is not None and resolve_all:
+            return web.json_response(
+                _openai_error(
+                    "Exact approval request binding cannot be combined with resolve_all",
+                    code="invalid_approval_scope",
+                ),
+                status=400,
             )
+        try:
+            from tools.approval import has_blocking_approval, resolve_gateway_approval
+
+            resolve_kwargs = {"resolve_all": resolve_all}
+            if request_id is not None:
+                resolve_kwargs["request_id"] = request_id
+            resolved = resolve_gateway_approval(
+                approval_session_key, choice, **resolve_kwargs,
+            )
+            still_pending = has_blocking_approval(approval_session_key)
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
             return web.json_response(_openai_error(str(exc)), status=500)
 
         if resolved <= 0:
+            error_code = (
+                "approval_request_not_pending"
+                if request_id is not None
+                else "approval_not_pending"
+            )
+            message = (
+                f"Run has no pending approval matching request_id: {run_id}"
+                if request_id is not None
+                else f"Run has no pending approval: {run_id}"
+            )
             return web.json_response(
                 _openai_error(
-                    f"Run has no pending approval: {run_id}",
-                    code="approval_not_pending",
+                    message,
+                    code=error_code,
                 ),
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
-            except Exception:
-                pass
+        pending_approvals = self._run_pending_approvals.setdefault(run_id, {})
+        if request_id is not None:
+            pending_approvals.pop(request_id, None)
+        else:
+            for pending_id in list(pending_approvals)[:resolved]:
+                pending_approvals.pop(pending_id, None)
+        pending_action = self._current_pending_action(run_id)
+        next_status = (
+            "waiting_for_approval"
+            if pending_action or still_pending
+            else "running"
+        )
+        self._set_run_status(
+            run_id,
+            next_status,
+            last_event="approval.responded",
+            pending_action=pending_action,
+        )
+        responded_event = {
+            "event": "approval.responded",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "choice": choice,
+            "resolved": resolved,
+        }
+        if request_id is not None:
+            responded_event["request_id"] = request_id
+        self._publish_run_event(run_id, responded_event)
 
-        return web.json_response({
+        response_data = {
             "object": "hermes.run.approval_response",
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
+        }
+        if request_id is not None:
+            response_data["request_id"] = request_id
+        return web.json_response(response_data)
+
+    async def _handle_run_clarification(self, request: "web.Request") -> "web.Response":
+        """Answer one exact, run-bound clarification request."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        if run_id not in self._run_statuses:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("JSON body must be an object"), status=400)
+
+        request_id = body.get("request_id")
+        if not isinstance(request_id, str) or not _RUN_CLARIFY_REQUEST_ID_RE.fullmatch(request_id):
+            return web.json_response(
+                _openai_error(
+                    "Invalid clarification request_id",
+                    code="invalid_clarification_request_id",
+                ),
+                status=400,
+            )
+        response = body.get("response")
+        if not isinstance(response, dict):
+            return web.json_response(
+                _openai_error(
+                    "Clarification response must be an object",
+                    code="invalid_clarification_response",
+                ),
+                status=400,
+            )
+
+        clarify_session_key = self._run_clarify_sessions.get(run_id)
+        if not clarify_session_key:
+            return web.json_response(
+                _openai_error(
+                    f"Run has no active clarification session: {run_id}",
+                    code="clarification_not_active",
+                ),
+                status=409,
+            )
+        from tools import clarify_gateway
+
+        pending = clarify_gateway.get_pending_by_id(
+            request_id,
+            session_key=clarify_session_key,
+        )
+        if pending is None:
+            return web.json_response(
+                _openai_error(
+                    "Clarification is stale, unknown, resolved, or belongs to another run",
+                    code="clarification_not_pending",
+                ),
+                status=409,
+            )
+
+        response_type = response.get("type")
+        if response_type == "choice":
+            choice_id = response.get("choice_id")
+            choices = pending.get("choices") or []
+            match = re.fullmatch(r"choice-([1-4])", str(choice_id or ""))
+            index = int(match.group(1)) - 1 if match else -1
+            if index < 0 or index >= len(choices):
+                return web.json_response(
+                    _openai_error(
+                        "Invalid clarification choice_id",
+                        code="invalid_clarification_choice",
+                    ),
+                    status=400,
+                )
+            answer = str(choices[index])
+            response_summary: Dict[str, Any] = {
+                "type": "choice",
+                "choice_id": choice_id,
+            }
+        elif response_type == "text":
+            text = response.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return web.json_response(
+                    _openai_error(
+                        "Clarification text must be a non-empty string",
+                        code="invalid_clarification_text",
+                    ),
+                    status=400,
+                )
+            if len(text) > _RUN_CLARIFY_MAX_RESPONSE_CHARS:
+                return web.json_response(
+                    _openai_error(
+                        f"Clarification text exceeds {_RUN_CLARIFY_MAX_RESPONSE_CHARS} characters",
+                        code="clarification_text_too_long",
+                    ),
+                    status=400,
+                )
+            answer = text.strip()
+            response_summary = {"type": "text"}
+        else:
+            return web.json_response(
+                _openai_error(
+                    "Clarification response type must be 'choice' or 'text'",
+                    code="invalid_clarification_response_type",
+                ),
+                status=400,
+            )
+
+        if not clarify_gateway.resolve_gateway_clarify(
+            request_id,
+            answer,
+            session_key=clarify_session_key,
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Clarification is no longer pending",
+                    code="clarification_not_pending",
+                ),
+                status=409,
+            )
+
+        self._run_pending_clarifications.setdefault(run_id, {}).pop(
+            request_id, None
+        )
+        self._set_run_status(
+            run_id,
+            "running",
+            last_event="clarify.responded",
+            pending_action=self._current_pending_action(run_id),
+        )
+        event = {
+            "event": "clarify.responded",
+            "run_id": run_id,
+            "request_id": request_id,
+            "timestamp": time.time(),
+            **response_summary,
+        }
+        self._publish_run_event(run_id, event)
+        return web.json_response({
+            "object": "hermes.run.clarification_response",
+            "run_id": run_id,
+            "request_id": request_id,
+            **response_summary,
         })
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
@@ -5416,12 +7562,26 @@ class APIServerAdapter(BasePlatformAdapter):
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+        self._set_run_status(
+            run_id,
+            "stopping",
+            last_event="run.stopping",
+            pending_action=None,
+        )
         self._stopping_run_ids.add(run_id)
 
         if agent is not None:
             try:
                 agent.interrupt("Stop requested via API")
+            except Exception:
+                pass
+
+        clarify_session_key = self._run_clarify_sessions.get(run_id)
+        if clarify_session_key:
+            try:
+                from tools.clarify_gateway import clear_session
+
+                clear_session(clarify_session_key)
             except Exception:
                 pass
 
@@ -5442,6 +7602,10 @@ class APIServerAdapter(BasePlatformAdapter):
             for run_id, created_at in list(self._run_streams_created.items())
             if now - created_at > self._RUN_STREAM_TTL
             and run_id not in self._run_stream_subscribers
+            and (
+                self._active_run_tasks.get(run_id) is None
+                or self._active_run_tasks[run_id].done()
+            )
         ]
         for run_id in stale:
             logger.debug("[api_server] sweeping expired run transport %s", run_id)
@@ -5460,10 +7624,27 @@ class APIServerAdapter(BasePlatformAdapter):
             # independent and survives until the executor-backed task returns.
             self._run_streams.pop(run_id, None)
             self._run_streams_created.pop(run_id, None)
+            self._run_event_logs.pop(run_id, None)
+            self._run_event_log_bytes.pop(run_id, None)
+            self._run_delta_buffers.pop(run_id, None)
+            self._run_redact_until_newline.discard(run_id)
+            self._run_credential_prefixes.pop(run_id, None)
+            self._run_event_sequences.pop(run_id, None)
+            self._run_subscriber_queues.pop(run_id, None)
+            self._run_pending_approvals.pop(run_id, None)
+            self._run_pending_clarifications.pop(run_id, None)
             if task_done:
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                clarify_session_key = self._run_clarify_sessions.pop(run_id, None)
+                if clarify_session_key:
+                    try:
+                        from tools.clarify_gateway import clear_session
+
+                        clear_session(clarify_session_key)
+                    except Exception:
+                        pass
                 self._stopping_run_ids.discard(run_id)
 
         stale_statuses = [
