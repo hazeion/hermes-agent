@@ -128,6 +128,14 @@ async def test_http_route_uses_normal_bearer_auth_and_advertises_contract():
     assert data["features"]["kanban_api"] is True
     assert data["features"]["kanban_api_revisioned"] is True
     assert data["endpoints"]["kanban_task_action"]["path"].startswith("/v1/kanban/")
+    assert data["features"]["kanban_artifacts"] is True
+    assert data["features"]["kanban_artifacts_version"] == 1
+    assert data["features"]["kanban_artifacts_requires_api_key"] is True
+    assert data["features"]["kanban_artifacts_digests"] is True
+    assert data["features"]["kanban_artifacts_max_files"] == 10
+    assert data["features"]["kanban_artifacts_max_bytes"] == 100 * 1024 * 1024
+    assert data["features"]["kanban_artifacts_max_total_bytes"] == 250 * 1024 * 1024
+    assert data["endpoints"]["kanban_task_artifact"]["path"].endswith("?board={board}")
 
 
 def test_http_route_table_includes_every_kanban_contract_path():
@@ -140,4 +148,6 @@ def test_http_route_table_includes_every_kanban_contract_path():
         ("POST", "/v1/kanban/tasks"),
         ("GET", "/v1/kanban/tasks/{task_id}"),
         ("POST", "/v1/kanban/tasks/{task_id}/actions"),
+        ("GET", "/v1/kanban/tasks/{task_id}/artifacts"),
+        ("GET", "/v1/kanban/tasks/{task_id}/artifacts/{artifact_id}"),
     } <= routes

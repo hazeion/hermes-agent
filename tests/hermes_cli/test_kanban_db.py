@@ -2389,6 +2389,9 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     assert persisted.parent == kb.task_attachments_dir(t)
     assert persisted.name == "chart.png"
     assert persisted.read_bytes() == b"png-bytes"
+    if os.name == "posix":
+        assert persisted.parent.stat().st_mode & 0o777 == 0o700
+        assert persisted.stat().st_mode & 0o777 == 0o600
     assert str(persisted) != str(artifact)
     assert run is not None
     assert run.metadata["artifacts"] == [str(persisted)]
@@ -2397,6 +2400,198 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     assert [(a.filename, a.stored_path) for a in attachments] == [
         ("chart.png", str(persisted.resolve()))
     ]
+
+
+def test_completion_replaces_prior_artifacts_and_removes_old_file(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="retry output",
+            created_by="api_server",
+        )
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        first = workspace / "first.md"
+        first.write_text("first", encoding="utf-8")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            metadata={"artifacts": [str(first.resolve())]},
+        )
+        old = Path(kb.list_attachments(conn, task_id)[0].stored_path)
+        retry_workspace = kb.workspaces_root() / task_id
+        retry_workspace.mkdir(parents=True, exist_ok=True)
+        kb.set_workspace_path(conn, task_id, retry_workspace)
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        second = retry_workspace / "second.md"
+        second.write_text("second", encoding="utf-8")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            metadata={"artifacts": [str(second.resolve())]},
+        )
+        latest = kb.list_attachments(conn, task_id)
+    assert [item.filename for item in latest] == ["second.md"]
+    assert not old.exists()
+
+
+def test_named_board_completion_replaces_prior_artifact_file(kanban_home):
+    kb.create_board("work-proj")
+    assert kb.get_current_board() == "default"
+
+    with kb.connect(board="work-proj") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="named board retry output",
+            created_by="api_server",
+            board="work-proj",
+        )
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task, board="work-proj")
+        kb.set_workspace_path(conn, task_id, workspace)
+        first = workspace / "first.md"
+        first.write_text("first", encoding="utf-8")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            metadata={"artifacts": [str(first.resolve())]},
+        )
+        old = Path(kb.list_attachments(conn, task_id)[0].stored_path)
+
+        retry_workspace = kb.workspaces_root(board="work-proj") / task_id
+        retry_workspace.mkdir(parents=True, exist_ok=True)
+        kb.set_workspace_path(conn, task_id, retry_workspace)
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        second = retry_workspace / "second.md"
+        second.write_text("second", encoding="utf-8")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            metadata={"artifacts": [str(second.resolve())]},
+        )
+        latest = kb.list_attachments(conn, task_id)
+
+    assert kb.get_current_board() == "default"
+    assert [item.filename for item in latest] == ["second.md"]
+    assert not old.exists()
+
+
+def test_completion_rollback_removes_newly_staged_copy(
+    kanban_home,
+    monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="rollback output",
+            created_by="api_server",
+        )
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "result.md"
+        artifact.write_text("result", encoding="utf-8")
+        monkeypatch.setattr(
+            kb,
+            "_end_run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("forced post-insert failure")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="forced post-insert failure"):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={"artifacts": [str(artifact.resolve())]},
+            )
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.list_attachments(conn, task_id) == []
+        attachment_dir = kb.task_attachments_dir(task_id)
+        assert not attachment_dir.exists() or list(attachment_dir.iterdir()) == []
+
+
+def test_named_board_completion_rollback_removes_staged_copy(
+    kanban_home,
+    monkeypatch,
+):
+    kb.create_board("work-proj")
+    assert kb.get_current_board() == "default"
+
+    with kb.connect(board="work-proj") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="named board rollback output",
+            created_by="api_server",
+            board="work-proj",
+        )
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task, board="work-proj")
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "result.md"
+        artifact.write_text("result", encoding="utf-8")
+        monkeypatch.setattr(
+            kb,
+            "_end_run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("forced named-board post-insert failure")
+            ),
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="forced named-board post-insert failure",
+        ):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={"artifacts": [str(artifact.resolve())]},
+            )
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.list_attachments(conn, task_id) == []
+
+    assert kb.get_current_board() == "default"
+    attachment_dir = kb.task_attachments_dir(task_id, board="work-proj")
+    assert not attachment_dir.exists() or list(attachment_dir.iterdir()) == []
+
+
+def test_completion_rejects_symlinked_destination_directory(
+    kanban_home,
+    tmp_path,
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="unsafe destination",
+            created_by="api_server",
+        )
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "result.md"
+        artifact.write_text("safe", encoding="utf-8")
+        task_dir = kb.task_attachments_dir(task_id)
+        task_dir.parent.mkdir(parents=True, exist_ok=True)
+        task_dir.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(
+            kb.ArtifactPreservationError,
+            match="directory is unsafe",
+        ):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={"artifacts": [str(artifact.resolve())]},
+            )
+        assert list(outside.iterdir()) == []
 
 
 def test_complete_task_rejects_missing_declared_scratch_artifact(kanban_home):
@@ -2444,35 +2639,108 @@ def test_complete_task_preserves_legacy_artifact_path_from_summary(kanban_home):
     assert persisted.parent == kb.task_attachments_dir(t)
 
 
-def test_complete_task_leaves_non_scratch_artifact_paths_unchanged(
+def test_complete_task_rejects_artifacts_outside_managed_scratch(
     kanban_home,
     tmp_path,
 ):
-    """Only artifacts inside the managed scratch workspace are copied."""
+    """External paths never become downloadable completion artifacts."""
     external = tmp_path / "report.md"
     external.write_text("keep me here", encoding="utf-8")
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="external report")
+        t = kb.create_task(conn, title="external report", created_by="api_server")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
 
-        assert kb.complete_task(
-            conn,
-            t,
-            result="ok",
-            metadata={"artifacts": [str(external)]},
-        )
+        with pytest.raises(kb.ArtifactPreservationError, match="outside"):
+            kb.complete_task(
+                conn,
+                t,
+                result="ok",
+                metadata={"artifacts": [str(external)]},
+            )
 
-        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
-        run = kb.latest_run(conn, t)
-
-    assert not ws.exists(), "scratch workspace should still be cleaned up"
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.list_attachments(conn, t) == []
+    assert ws.exists(), "failed completion must keep scratch available for retry"
     assert external.exists()
-    assert completed.payload["artifacts"] == [str(external)]
-    assert run is not None
-    assert run.metadata["artifacts"] == [str(external)]
+
+
+def test_complete_task_rejects_symlink_and_hardlink_artifacts(kanban_home, tmp_path):
+    """Workspace aliases cannot smuggle another file into task attachments."""
+    outside = tmp_path / "outside.md"
+    outside.write_text("private", encoding="utf-8")
+    with kb.connect() as conn:
+        for title, link_kind in (("symbolic", "symlink"), ("hard", "hardlink")):
+            t = kb.create_task(conn, title=title, created_by="api_server")
+            task = kb.get_task(conn, t)
+            ws = kb.resolve_workspace(task)
+            kb.set_workspace_path(conn, t, ws)
+            linked = ws / f"{link_kind}.md"
+            if link_kind == "symlink":
+                linked.symlink_to(outside)
+            else:
+                os.link(outside, linked)
+            with pytest.raises(kb.ArtifactPreservationError):
+                kb.complete_task(
+                    conn,
+                    t,
+                    result="ok",
+                    metadata={"artifacts": [str(linked)]},
+                )
+            assert kb.get_task(conn, t).status == "ready"
+            assert kb.list_attachments(conn, t) == []
+
+
+def test_complete_task_enforces_artifact_count_and_size_bounds(
+    kanban_home,
+    monkeypatch,
+):
+    """Exact count, per-file, and combined limits fail before task completion."""
+    monkeypatch.setattr(kb, "KANBAN_ARTIFACT_MAX_COUNT", 2)
+    monkeypatch.setattr(kb, "KANBAN_ARTIFACT_MAX_BYTES", 5)
+    monkeypatch.setattr(kb, "KANBAN_ARTIFACT_MAX_TOTAL_BYTES", 8)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="bounded", created_by="api_server")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        first = ws / "first.txt"
+        second = ws / "second.txt"
+        third = ws / "third.txt"
+        first.write_bytes(b"12345")
+        second.write_bytes(b"1234")
+        third.write_bytes(b"1")
+
+        with pytest.raises(kb.ArtifactPreservationError, match="combined"):
+            kb.complete_task(
+                conn,
+                t,
+                result="ok",
+                metadata={"artifacts": [str(first), str(second)]},
+            )
+        assert kb.get_task(conn, t).status == "ready"
+
+        with pytest.raises(kb.ArtifactPreservationError, match="2-file"):
+            kb.complete_task(
+                conn,
+                t,
+                result="ok",
+                metadata={"artifacts": [str(first), str(third), str(second)]},
+            )
+        assert kb.get_task(conn, t).status == "ready"
+
+        second.write_bytes(b"123456")
+        with pytest.raises(kb.ArtifactPreservationError, match="5-byte"):
+            kb.complete_task(
+                conn,
+                t,
+                result="ok",
+                metadata={"artifacts": [str(second)]},
+            )
+        assert kb.get_task(conn, t).status == "ready"
 
 
 def test_complete_task_persists_duplicate_scratch_artifact_names(kanban_home):

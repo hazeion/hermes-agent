@@ -14,6 +14,8 @@ Exposes an HTTP server with endpoints:
 - GET/POST /v1/kanban/tasks        — bounded task listing and idempotent creation
 - GET  /v1/kanban/tasks/{task_id}  — exact task snapshot with revision
 - POST /v1/kanban/tasks/{task_id}/actions — revision-bound fixed task actions
+- GET  /v1/kanban/tasks/{task_id}/artifacts — bounded generated artifact manifest
+- GET  /v1/kanban/tasks/{task_id}/artifacts/{artifact_id} — authenticated artifact bytes
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
@@ -69,6 +71,7 @@ import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
+from urllib.parse import quote
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -1904,6 +1907,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/kanban/tasks", self._handle_create_kanban_task),
             ("GET", "/v1/kanban/tasks/{task_id}", self._handle_kanban_task),
             ("POST", "/v1/kanban/tasks/{task_id}/actions", self._handle_kanban_action),
+            ("GET", "/v1/kanban/tasks/{task_id}/artifacts", self._handle_kanban_artifacts),
+            ("GET", "/v1/kanban/tasks/{task_id}/artifacts/{artifact_id}", self._handle_kanban_artifact),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
@@ -2823,6 +2828,63 @@ class APIServerAdapter(BasePlatformAdapter):
             payload,
         )
 
+    async def _handle_kanban_artifacts(self, request: "web.Request") -> "web.Response":
+        from gateway.kanban_artifacts import list_artifacts
+        return await self._kanban_api_call(
+            request,
+            list_artifacts,
+            request.query.get("board"),
+            request.match_info.get("task_id"),
+        )
+
+    async def _handle_kanban_artifact(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    "Kanban artifact API requires API key authentication",
+                    code="kanban_artifact_api_auth_required",
+                ),
+                status=403,
+            )
+        try:
+            from gateway.kanban_api import KanbanApiError
+            from gateway.kanban_artifacts import open_artifact
+            metadata, content = await asyncio.to_thread(
+                open_artifact,
+                request.query.get("board"),
+                request.match_info.get("task_id"),
+                request.match_info.get("artifact_id"),
+            )
+        except KanbanApiError as exc:
+            return web.json_response(
+                _openai_error(exc.message, code=exc.code), status=exc.status
+            )
+        except Exception:
+            logger.exception("Kanban artifact download failed")
+            return web.json_response(
+                _openai_error(
+                    "Kanban artifact is temporarily unavailable",
+                    err_type="server_error",
+                    code="kanban_artifact_unavailable",
+                ),
+                status=503,
+            )
+        filename = quote(metadata["name"], safe="")
+        return web.Response(
+            body=content,
+            content_type=metadata["mime_type"],
+            headers={
+                "Cache-Control": "private, no-store",
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+                "X-Content-Type-Options": "nosniff",
+                "X-Hermes-Artifact-Digest": metadata["digest"],
+                "X-Hermes-Artifact-Id": metadata["id"],
+            },
+        )
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -2912,6 +2974,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 "kanban_api_revisioned": True,
                 "kanban_api_idempotency": True,
                 "kanban_api_requires_api_key": True,
+                "kanban_artifacts": bool(self._api_key),
+                "kanban_artifacts_version": 1,
+                "kanban_artifacts_requires_api_key": True,
+                "kanban_artifacts_digests": True,
+                "kanban_artifacts_max_files": 10,
+                "kanban_artifacts_max_bytes": 100 * 1024 * 1024,
+                "kanban_artifacts_max_total_bytes": 250 * 1024 * 1024,
                 "audio_api": False,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -2933,6 +3002,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "kanban_task": {"method": "GET", "path": "/v1/kanban/tasks/{task_id}?board={board}"},
                 "kanban_task_create": {"method": "POST", "path": "/v1/kanban/tasks?board={board}"},
                 "kanban_task_action": {"method": "POST", "path": "/v1/kanban/tasks/{task_id}/actions?board={board}"},
+                "kanban_task_artifacts": {"method": "GET", "path": "/v1/kanban/tasks/{task_id}/artifacts?board={board}"},
+                "kanban_task_artifact": {"method": "GET", "path": "/v1/kanban/tasks/{task_id}/artifacts/{artifact_id}?board={board}"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},

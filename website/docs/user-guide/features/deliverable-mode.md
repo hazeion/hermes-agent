@@ -97,6 +97,15 @@ summary in one place.
 
 Files that don't exist on disk when the notifier runs are silently skipped.
 
+This local notification behavior still accepts ordinary absolute paths such as
+`/tmp/...`. API-created Kanban tasks that expose files to a remote control
+plane use a stricter rule: the worker must explicitly declare a regular file
+inside its managed task scratch workspace. Hermes copies that file into private
+task attachment storage before cleanup; outside paths and prose-only path
+mentions never become remote downloads. Supported raster files are decoded and
+re-encoded into metadata-free canonical snapshots before the remote API serves
+them; the original container is not downloaded.
+
 ## Connecting more services with MCP
 
 Beyond the artifact-delivery pipeline, the agent can reach into other
