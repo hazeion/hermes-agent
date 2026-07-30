@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import base64
+import io
 
 import pytest
+from PIL import Image, PngImagePlugin
 
 from gateway.config import PlatformConfig
 from gateway.kanban_artifacts import list_artifacts, read_artifact
@@ -171,6 +173,67 @@ def test_structurally_valid_png_is_published():
     manifest = list_artifacts("default", task_id)
     assert len(manifest["data"]) == 1
     assert manifest["data"][0]["mime_type"] == "image/png"
+
+
+@pytest.mark.parametrize("format_name", ["PNG", "JPEG", "GIF", "WEBP"])
+def test_published_rasters_are_canonical_and_metadata_free(format_name):
+    marker = b"hidden-archive-marker-PK0304"
+    image = Image.new("RGB", (2, 2), (20, 40, 60))
+    source = io.BytesIO()
+    extension = format_name.lower()
+    save_options = {}
+    if format_name == "PNG":
+        png_info = PngImagePlugin.PngInfo()
+        png_info.add_text("payload", marker.decode("ascii"))
+        save_options["pnginfo"] = png_info
+    elif format_name == "JPEG":
+        extension = "jpg"
+        exif = Image.Exif()
+        exif[0x9286] = marker
+        save_options["exif"] = exif
+    elif format_name == "GIF":
+        save_options["comment"] = marker
+    else:
+        save_options.update(lossless=True, xmp=marker)
+    image.save(source, format=format_name, **save_options)
+    task_id, _attachment = _completed_task(
+        name=f"payload.{extension}",
+        content=source.getvalue(),
+    )
+
+    manifest = list_artifacts("default", task_id)
+    assert len(manifest["data"]) == 1
+    artifact = manifest["data"][0]
+    downloaded, content = read_artifact("default", task_id, artifact["id"])
+    assert downloaded == artifact
+    assert marker not in content
+    with Image.open(io.BytesIO(content)) as normalized:
+        normalized.load()
+        assert not {
+            "comment",
+            "exif",
+            "xmp",
+            "XML:com.adobe.xmp",
+            "payload",
+        } & set(normalized.info)
+
+
+def test_published_jpeg_applies_orientation_before_removing_exif():
+    image = Image.new("RGB", (2, 1), (20, 40, 60))
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    source = io.BytesIO()
+    image.save(source, format="JPEG", exif=exif)
+    task_id, _attachment = _completed_task(
+        name="oriented.jpg",
+        content=source.getvalue(),
+    )
+    artifact = list_artifacts("default", task_id)["data"][0]
+    _metadata, content = read_artifact("default", task_id, artifact["id"])
+    with Image.open(io.BytesIO(content)) as normalized:
+        normalized.load()
+        assert normalized.size == (1, 2)
+        assert "exif" not in normalized.info
 
 
 def test_generic_agent_attachment_is_not_a_completion_artifact():

@@ -636,9 +636,10 @@ same bearer authentication and set private/no-store and nosniff headers.
 
 The artifact surface allows at most 10 files, 100 MiB per file, and 250 MiB
 combined. It accepts common UTF-8 text/source formats and PNG, JPEG, GIF, or
-WebP images. Raster files must decode structurally, stay within fixed frame and
-pixel limits, and end at the format's real container terminator. Inputs,
-generic agent attachments, prose-mentioned paths, older
+WebP images. Raster files must decode structurally and stay within fixed frame
+and pixel limits. Hermes serves a metadata-free canonical re-encode, not the
+original container, so unknown chunks and embedded or appended payloads are
+discarded. Inputs, generic agent attachments, prose-mentioned paths, older
 retry outputs, HTML/SVG/PDF, archives, executables, links, malformed content,
 and recognizable credential material are not published. Consumers must verify
 the advertised digest and keep their own private snapshot when persistence is
