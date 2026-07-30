@@ -17,6 +17,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/kanban/tasks/{task_id}/artifacts — bounded generated artifact manifest
 - GET  /v1/kanban/tasks/{task_id}/artifacts/{artifact_id} — authenticated artifact bytes
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- GET  /v1/jobs                    : bounded read-only cron inventory for dashboards
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -69,8 +70,9 @@ import threading
 import time
 import uuid
 from collections import deque
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Set
 from urllib.parse import quote
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
@@ -303,6 +305,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+JOB_INVENTORY_VERSION = 1
+JOB_INVENTORY_MAX_JOBS = 128
+JOB_INVENTORY_MAX_RESPONSE_BYTES = 256 * 1024
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -1276,6 +1281,9 @@ _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
         list_jobs as _cron_list,
+        read_jobs_snapshot as _cron_read_snapshot,
+        READ_ONLY_JOBS_SNAPSHOT_SUPPORTED as _CRON_READ_SNAPSHOT_SUPPORTED,
+        parse_schedule as _cron_parse_schedule,
         get_job as _cron_get,
         create_job as _cron_create,
         update_job as _cron_update,
@@ -1287,6 +1295,9 @@ try:
     _CRON_AVAILABLE = True
 except ImportError:
     _cron_list = None
+    _cron_read_snapshot = None
+    _CRON_READ_SNAPSHOT_SUPPORTED = False
+    _cron_parse_schedule = None
     _cron_get = None
     _cron_create = None
     _cron_update = None
@@ -1294,6 +1305,160 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+
+
+_JOB_INVENTORY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}")
+_JOB_INVENTORY_CRON_RE = re.compile(r"[0-9*?,/\- ]{5,200}")
+_JOB_INVENTORY_STATUSES = frozenset(
+    {
+        "ok",
+        "error",
+        "claimed",
+        "running",
+        "completed",
+        "failed",
+        "unknown",
+        "scheduled",
+        "paused",
+    }
+)
+
+
+def _job_inventory_revision(job: Dict[str, Any]) -> str:
+    canonical = json.dumps(
+        job,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _job_inventory_id(job: Dict[str, Any], revision: str) -> str:
+    raw_id = job.get("id")
+    if isinstance(raw_id, str):
+        candidate = raw_id.strip()
+        if _JOB_INVENTORY_ID_RE.fullmatch(candidate):
+            return candidate
+    return f"job_{revision[:24]}"
+
+
+def _job_inventory_name(job_id: str) -> str:
+    """Return a label that cannot inherit stored prompt text."""
+    return f"Cron job {job_id}"
+
+
+def _job_inventory_timestamp(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
+def _job_inventory_schedule(job: Dict[str, Any]) -> str:
+    schedule = job.get("schedule")
+    parsed: Dict[str, Any]
+    if isinstance(schedule, str):
+        try:
+            parsed = _cron_parse_schedule(schedule)
+        except Exception:
+            return "Schedule unavailable"
+    elif isinstance(schedule, dict):
+        parsed = schedule
+    else:
+        return "Schedule unavailable"
+
+    kind = parsed.get("kind")
+    if kind == "cron":
+        expression = parsed.get("expr")
+        if not isinstance(expression, str):
+            return "Schedule unavailable"
+        expression = " ".join(expression.split())
+        fields = expression.split()
+        if (
+            len(fields) not in {5, 6}
+            or _JOB_INVENTORY_CRON_RE.fullmatch(expression) is None
+        ):
+            return "Schedule unavailable"
+        try:
+            validated = _cron_parse_schedule(expression)
+        except Exception:
+            return "Schedule unavailable"
+        if validated.get("kind") != "cron":
+            return "Schedule unavailable"
+        return expression
+    if kind == "interval":
+        minutes = parsed.get("minutes")
+        if (
+            type(minutes) is not int
+            or minutes < 1
+            or minutes > 10 * 365 * 24 * 60
+        ):
+            return "Schedule unavailable"
+        return f"every {minutes}m"
+    if kind == "once":
+        run_at = _job_inventory_timestamp(parsed.get("run_at"))
+        return run_at or "Schedule unavailable"
+    return "Schedule unavailable"
+
+
+def _job_inventory_status(job: Dict[str, Any], *, enabled: bool) -> str:
+    for value in (job.get("last_status"), job.get("state")):
+        if isinstance(value, str):
+            candidate = value.strip().lower()
+            if candidate in _JOB_INVENTORY_STATUSES:
+                return candidate
+    return "scheduled" if enabled else "paused"
+
+
+def _project_job_inventory(raw_jobs: Any) -> Dict[str, Any]:
+    if type(raw_jobs) is not list:
+        raise ValueError("Cron inventory storage must contain a jobs list")
+    if len(raw_jobs) > JOB_INVENTORY_MAX_JOBS:
+        raise ValueError("Cron inventory exceeds the advertised job limit")
+
+    jobs: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    for raw_job in raw_jobs:
+        if type(raw_job) is not dict:
+            raise ValueError("Cron inventory contains an invalid job record")
+        revision = _job_inventory_revision(raw_job)
+        job_id = _job_inventory_id(raw_job, revision)
+        if job_id in seen_ids:
+            raise ValueError("Cron inventory contains duplicate job identities")
+        seen_ids.add(job_id)
+        enabled_value = raw_job.get("enabled", True)
+        if type(enabled_value) is not bool:
+            enabled_value = True
+        jobs.append(
+            {
+                "id": job_id,
+                "name": _job_inventory_name(job_id),
+                "schedule": _job_inventory_schedule(raw_job),
+                "enabled": enabled_value,
+                "last_run": _job_inventory_timestamp(raw_job.get("last_run_at")),
+                "next_run": _job_inventory_timestamp(raw_job.get("next_run_at")),
+                "last_status": _job_inventory_status(
+                    raw_job,
+                    enabled=enabled_value,
+                ),
+                "configuration_revision": revision,
+            }
+        )
+
+    return {
+        "object": "hermes.jobs.inventory",
+        "version": JOB_INVENTORY_VERSION,
+        "count": len(jobs),
+        "enabled_count": sum(1 for job in jobs if job["enabled"]),
+        "jobs": jobs,
+    }
 
 
 def _notify_cron_provider_jobs_changed() -> None:
@@ -1936,6 +2101,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/kanban/tasks/{task_id}/artifacts", self._handle_kanban_artifacts),
             ("GET", "/v1/kanban/tasks/{task_id}/artifacts/{artifact_id}", self._handle_kanban_artifact),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("GET", "/v1/jobs", self._handle_job_inventory),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -2980,6 +3146,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_session_continuation_stoppable": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
+                "jobs_inventory": bool(
+                    self._api_key
+                    and _CRON_AVAILABLE
+                    and _CRON_READ_SNAPSHOT_SUPPORTED
+                ),
+                "jobs_inventory_version": JOB_INVENTORY_VERSION,
+                "jobs_inventory_complete": True,
+                "jobs_inventory_requires_api_key": True,
+                "jobs_inventory_read_only": True,
+                "jobs_inventory_max_jobs": JOB_INVENTORY_MAX_JOBS,
+                "jobs_inventory_max_response_bytes": JOB_INVENTORY_MAX_RESPONSE_BYTES,
                 "memory_write_api": False,
                 "skills_api": True,
                 "profile_inventory": bool(self._api_key),
@@ -3053,6 +3230,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "jobs_inventory": {
+                    "method": "GET",
+                    "path": "/v1/jobs",
+                    "version": JOB_INVENTORY_VERSION,
+                },
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -5261,6 +5443,38 @@ class APIServerAdapter(BasePlatformAdapter):
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_job_inventory(self, request: "web.Request") -> "web.Response":
+        """GET /v1/jobs: return a bounded, read-only public cron projection."""
+        if not self._api_key:
+            return web.json_response(
+                {"error": "Cron inventory requires API server authentication"},
+                status=503,
+            )
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        if not _CRON_READ_SNAPSHOT_SUPPORTED:
+            return web.json_response(
+                {"error": "Read-only cron inventory is unavailable"},
+                status=501,
+            )
+        try:
+            payload = _project_job_inventory(_cron_read_snapshot())
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(encoded) > JOB_INVENTORY_MAX_RESPONSE_BYTES:
+                raise ValueError("Cron inventory exceeds the advertised byte limit")
+            return web.Response(body=encoded, content_type="application/json")
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

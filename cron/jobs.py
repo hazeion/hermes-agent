@@ -17,6 +17,7 @@ import threading
 import time
 import os
 import re
+import stat
 import uuid
 
 # Cross-process advisory file locking for jobs.json critical sections.
@@ -100,6 +101,8 @@ _jobs_lock_state = threading.local()
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+READ_ONLY_JOBS_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
+READ_ONLY_JOBS_SNAPSHOT_SUPPORTED = bool(getattr(os, "O_NOFOLLOW", 0))
 
 
 @dataclass(frozen=True)
@@ -905,6 +908,86 @@ def load_jobs() -> List[Dict[str, Any]]:
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
     )
+
+
+def read_jobs_snapshot() -> List[Dict[str, Any]]:
+    """Read the current jobs document without creating or repairing anything.
+
+    Writers replace ``jobs.json`` atomically. Holding the in-process lock while
+    opening the file gives this process a stable old-or-new snapshot, and the
+    open file descriptor stays valid if another process replaces the path.
+    Unlike ``load_jobs()``, this reader never creates directories, changes
+    permissions, writes repairs, or opens the advisory lock file.
+    """
+
+    nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+    if not isinstance(nofollow_flag, int) or nofollow_flag <= 0:
+        raise RuntimeError("Cron database cannot be opened without following links")
+
+    jobs_file = _current_cron_store().jobs_file
+    with _jobs_file_lock:
+        try:
+            path_metadata = os.lstat(jobs_file)
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise RuntimeError("Cron database could not be inspected read-only") from exc
+        if (
+            not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_nlink != 1
+            or path_metadata.st_size > READ_ONLY_JOBS_SNAPSHOT_MAX_BYTES
+        ):
+            raise RuntimeError("Cron database is not a bounded regular file")
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= nofollow_flag
+        try:
+            descriptor = os.open(jobs_file, flags)
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise RuntimeError("Cron database could not be opened read-only") from exc
+
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_size > READ_ONLY_JOBS_SNAPSHOT_MAX_BYTES
+                or metadata.st_dev != path_metadata.st_dev
+                or metadata.st_ino != path_metadata.st_ino
+            ):
+                raise RuntimeError("Cron database is not a bounded regular file")
+            chunks: List[bytes] = []
+            remaining = READ_ONLY_JOBS_SNAPSHOT_MAX_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > READ_ONLY_JOBS_SNAPSHOT_MAX_BYTES:
+                raise RuntimeError("Cron database exceeds the read-only snapshot limit")
+        finally:
+            os.close(descriptor)
+
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Cron database is not valid JSON") from exc
+
+    if isinstance(data, dict):
+        jobs = data.get("jobs", [])
+    elif isinstance(data, list):
+        jobs = data
+    else:
+        raise RuntimeError("Cron database must contain a jobs list")
+    if type(jobs) is not list:
+        raise RuntimeError("Cron database must contain a jobs list")
+    return jobs
 
 
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):

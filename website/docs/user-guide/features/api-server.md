@@ -535,9 +535,33 @@ or cross-run request IDs fail closed. Check `run_clarification_response` and
 
 The server exposes a lightweight jobs CRUD surface for managing scheduled / background agent runs from a remote client. All endpoints are gated behind the same bearer auth.
 
+### GET /v1/jobs
+
+Return a read-only list for dashboards and other clients that only need to show
+scheduled work. This endpoint always includes active and paused jobs.
+
+The response contains only the job ID, an opaque label, schedule, enabled state,
+last and next run times, status, and an opaque revision. It does not include
+prompts, stored names, delivery settings, work directories, or execution
+output. Labels use `Cron job <id>` because older Hermes jobs may have copied
+prompt text into the stored name. Invalid schedules become
+`Schedule unavailable`.
+
+The list is limited to 128 jobs and 256 KiB. Hermes returns an error instead of
+truncating a larger list. The endpoint is unavailable unless the API server has
+an API key, and every request must use that key. Hermes also keeps the
+capability off when the host cannot open the jobs file without following links.
+
+Clients should check `/v1/capabilities` before calling this endpoint. A
+compatible server advertises `jobs_inventory` version 1, the row and byte
+limits, and the exact `GET /v1/jobs` route. This capability does not grant
+permission to create, edit, delete, pause, resume, or run a job.
+
 ### GET /api/jobs
 
-List all scheduled jobs.
+List scheduled jobs for Jobs API administration. Add
+`?include_disabled=true` to include paused jobs. This broader response is not
+the read-only dashboard contract.
 
 ### POST /api/jobs
 

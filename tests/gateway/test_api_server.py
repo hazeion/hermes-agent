@@ -1393,6 +1393,13 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["profile_inventory_version"] == 1
             assert data["features"]["profile_inventory_complete"] is True
             assert data["features"]["profile_inventory_requires_api_key"] is True
+            assert data["features"]["jobs_inventory"] is False
+            assert data["features"]["jobs_inventory_version"] == 1
+            assert data["features"]["jobs_inventory_complete"] is True
+            assert data["features"]["jobs_inventory_requires_api_key"] is True
+            assert data["features"]["jobs_inventory_read_only"] is True
+            assert data["features"]["jobs_inventory_max_jobs"] == 128
+            assert data["features"]["jobs_inventory_max_response_bytes"] == 256 * 1024
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["run_clarification"] == {
                 "method": "POST",
@@ -1411,6 +1418,11 @@ class TestCapabilitiesEndpoint:
             }
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+            assert data["endpoints"]["jobs_inventory"] == {
+                "method": "GET",
+                "path": "/v1/jobs",
+                "version": 1,
+            }
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):
@@ -1427,6 +1439,45 @@ class TestCapabilitiesEndpoint:
             data = await authed.json()
             assert data["auth"]["required"] is True
             assert data["features"]["profile_inventory"] is True
+            assert data["features"]["jobs_inventory"] is True
+
+    @pytest.mark.asyncio
+    async def test_jobs_inventory_capability_tracks_cron_availability(
+        self,
+        auth_adapter,
+    ):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._CRON_AVAILABLE", False):
+                response = await cli.get(
+                    "/v1/capabilities",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                data = await response.json()
+
+        assert response.status == 200
+        assert data["features"]["jobs_inventory"] is False
+        assert data["features"]["jobs_inventory_read_only"] is True
+
+    @pytest.mark.asyncio
+    async def test_jobs_inventory_capability_requires_safe_snapshot_support(
+        self,
+        auth_adapter,
+    ):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.platforms.api_server._CRON_READ_SNAPSHOT_SUPPORTED",
+                False,
+            ):
+                response = await cli.get(
+                    "/v1/capabilities",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                data = await response.json()
+
+        assert response.status == 200
+        assert data["features"]["jobs_inventory"] is False
 
 
 # ---------------------------------------------------------------------------

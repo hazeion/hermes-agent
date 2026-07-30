@@ -11,6 +11,7 @@ Covers:
 """
 
 import logging
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +19,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+import cron.jobs as cron_jobs
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter, cors_middleware
 
@@ -55,6 +57,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app["api_server_adapter"] = adapter
     # Register only job routes (plus health for sanity)
     app.router.add_get("/health", adapter._handle_health)
+    app.router.add_get("/v1/jobs", adapter._handle_job_inventory)
     app.router.add_get("/api/jobs", adapter._handle_list_jobs)
     app.router.add_post("/api/jobs", adapter._handle_create_job)
     app.router.add_get("/api/jobs/{job_id}", adapter._handle_get_job)
@@ -130,6 +133,208 @@ class TestListJobs:
                 resp = await cli.get("/api/jobs")
                 assert resp.status == 200
                 mock_list.assert_called_once_with(include_disabled=False)
+
+
+class TestJobInventory:
+    @pytest.mark.asyncio
+    async def test_inventory_is_unavailable_without_server_authentication(
+        self,
+        adapter,
+    ):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/jobs")
+
+        assert response.status == 503
+
+    @pytest.mark.asyncio
+    async def test_inventory_is_authenticated_complete_and_public(self, auth_adapter):
+        private_prompt = "Bearer private-instruction-value"
+        raw_jobs = [
+            {
+                "id": "aabbccddeeff",
+                "name": "",
+                "prompt": private_prompt,
+                "workdir": "/private/workspace",
+                "deliver": "origin",
+                "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+                "enabled": True,
+                "state": "scheduled",
+                "last_run_at": "2026-07-28T09:00:00+00:00",
+                "next_run_at": "2026-07-29T09:00:00+00:00",
+                "last_status": "completed",
+            },
+            {
+                "id": "112233445566",
+                "name": "Weekly cleanup",
+                "prompt": "private paused instructions",
+                "schedule": "*/5 * * * *",
+                "enabled": False,
+                "state": "paused",
+                "last_status": "private status prose",
+            },
+        ]
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_read_snapshot",
+                return_value=raw_jobs,
+            ):
+                response = await cli.get(
+                    "/v1/jobs",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                data = await response.json()
+
+        assert response.status == 200
+        assert data["object"] == "hermes.jobs.inventory"
+        assert data["version"] == 1
+        assert data["count"] == 2
+        assert data["enabled_count"] == 1
+        assert data["jobs"][0]["name"] == "Cron job aabbccddeeff"
+        assert data["jobs"][0]["schedule"] == "0 9 * * *"
+        assert data["jobs"][0]["last_status"] == "completed"
+        assert data["jobs"][1]["schedule"] == "*/5 * * * *"
+        assert data["jobs"][1]["last_status"] == "paused"
+        assert set(data["jobs"][0]) == {
+            "id",
+            "name",
+            "schedule",
+            "enabled",
+            "last_run",
+            "next_run",
+            "last_status",
+            "configuration_revision",
+        }
+        public_json = json.dumps(data)
+        for private_value in (
+            private_prompt,
+            "private paused instructions",
+            "private status prose",
+            "/private/workspace",
+            "prompt",
+            "workdir",
+            "deliver",
+        ):
+            assert private_value not in public_json
+
+    @pytest.mark.asyncio
+    async def test_inventory_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/jobs")
+
+        assert response.status == 401
+
+    @pytest.mark.asyncio
+    async def test_inventory_fails_closed_without_no_follow_support(
+        self,
+        auth_adapter,
+    ):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_READ_SNAPSHOT_SUPPORTED",
+                False,
+            ), patch(f"{_MOD}._cron_read_snapshot") as snapshot:
+                response = await cli.get(
+                    "/v1/jobs",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+
+        assert response.status == 501
+        snapshot.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_prompt_derived_stored_name_is_never_published_or_rewritten(
+        self,
+        auth_adapter,
+        tmp_path,
+        monkeypatch,
+    ):
+        cron_dir = tmp_path / "cron"
+        jobs_path = cron_dir / "jobs.json"
+        monkeypatch.setattr(cron_jobs, "CRON_DIR", cron_dir)
+        monkeypatch.setattr(cron_jobs, "JOBS_FILE", jobs_path)
+        monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", cron_dir / "output")
+        private_prompt = "Review the private acquisition notes every morning"
+        created = cron_jobs.create_job(
+            prompt=private_prompt,
+            schedule="every 1h",
+            name=None,
+        )
+        assert created["name"] == private_prompt[:50]
+        before = jobs_path.read_bytes()
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                response = await cli.get(
+                    "/v1/jobs",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                data = await response.json()
+
+        assert response.status == 200
+        assert data["jobs"][0]["name"] == f"Cron job {created['id']}"
+        assert private_prompt not in json.dumps(data)
+        assert jobs_path.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_inventory_fails_whole_snapshot_above_advertised_limit(
+        self,
+        auth_adapter,
+    ):
+        raw_jobs = [
+            {
+                "id": f"{index:012x}",
+                "name": "Bounded job",
+                "schedule": {"kind": "interval", "minutes": 5},
+                "enabled": True,
+            }
+            for index in range(129)
+        ]
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_read_snapshot",
+                return_value=raw_jobs,
+            ):
+                response = await cli.get(
+                    "/v1/jobs",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                data = await response.json()
+
+        assert response.status == 500
+        assert set(data) == {"error"}
+        assert "limit" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_inventory_enforces_advertised_byte_limit(self, auth_adapter):
+        oversized = {
+            "object": "hermes.jobs.inventory",
+            "version": 1,
+            "count": 0,
+            "enabled_count": 0,
+            "jobs": [],
+            "padding": "x" * (256 * 1024),
+        }
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_read_snapshot",
+                return_value=[],
+            ), patch(
+                f"{_MOD}._project_job_inventory",
+                return_value=oversized,
+            ):
+                response = await cli.get(
+                    "/v1/jobs",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+
+        assert response.status == 500
 
 
 # ---------------------------------------------------------------------------

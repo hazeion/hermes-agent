@@ -3,13 +3,16 @@
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
+import cron.jobs as cron_jobs
 from cron.jobs import (
     parse_duration,
     parse_schedule,
     compute_next_run,
     create_job,
     load_jobs,
+    read_jobs_snapshot,
     save_jobs,
     get_job,
     list_jobs,
@@ -240,6 +243,80 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestJobCRUD:
+    def test_read_only_snapshot_missing_store_performs_no_writes(self, tmp_cron_dir):
+        jobs_path = tmp_cron_dir / "cron" / "jobs.json"
+        with patch("cron.jobs.ensure_dirs") as ensure, patch(
+            "cron.jobs.save_jobs"
+        ) as save:
+            assert read_jobs_snapshot() == []
+
+        ensure.assert_not_called()
+        save.assert_not_called()
+        assert not jobs_path.exists()
+
+    def test_read_only_snapshot_never_repairs_legacy_or_corrupt_store(
+        self,
+        tmp_cron_dir,
+    ):
+        cron_dir = tmp_cron_dir / "cron"
+        cron_dir.mkdir()
+        jobs_path = cron_dir / "jobs.json"
+        legacy = b'[{"id":"legacy","enabled":true}]'
+        jobs_path.write_bytes(legacy)
+
+        with patch("cron.jobs.ensure_dirs") as ensure, patch(
+            "cron.jobs.save_jobs"
+        ) as save:
+            assert read_jobs_snapshot() == [{"id": "legacy", "enabled": True}]
+
+        ensure.assert_not_called()
+        save.assert_not_called()
+        assert jobs_path.read_bytes() == legacy
+
+        corrupt = b'{"jobs":[{"id":"bad\x01value"}]}'
+        jobs_path.write_bytes(corrupt)
+        with patch("cron.jobs.ensure_dirs") as ensure, patch(
+            "cron.jobs.save_jobs"
+        ) as save, pytest.raises(RuntimeError, match="valid JSON"):
+            read_jobs_snapshot()
+
+        ensure.assert_not_called()
+        save.assert_not_called()
+        assert jobs_path.read_bytes() == corrupt
+
+    def test_read_only_snapshot_rejects_symlinked_store(self, tmp_cron_dir):
+        cron_dir = tmp_cron_dir / "cron"
+        cron_dir.mkdir()
+        outside = tmp_cron_dir / "outside.json"
+        outside.write_text('{"jobs":[]}', encoding="utf-8")
+        jobs_path = cron_dir / "jobs.json"
+        try:
+            jobs_path.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable")
+
+        with pytest.raises(RuntimeError, match="regular file"):
+            read_jobs_snapshot()
+
+        assert outside.read_text(encoding="utf-8") == '{"jobs":[]}'
+
+    def test_read_only_snapshot_fails_before_open_without_no_follow_support(
+        self,
+        tmp_cron_dir,
+    ):
+        with patch.object(
+            cron_jobs.os,
+            "O_NOFOLLOW",
+            0,
+            create=True,
+        ), patch("cron.jobs.os.open") as open_file, pytest.raises(
+            RuntimeError,
+            match="without following links",
+        ):
+            read_jobs_snapshot()
+
+        open_file.assert_not_called()
+
     def test_create_and_get(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="30m")
         assert job["id"]
