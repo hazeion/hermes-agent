@@ -360,6 +360,32 @@ RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
+def _agent_run_usage(agent: Any) -> Dict[str, int]:
+    """Build bounded billing totals and an exact active-context pair."""
+    usage = {
+        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+    }
+    if str(getattr(agent, "provider", "") or "").strip().lower() == "moa":
+        return usage
+    compressor = getattr(agent, "context_compressor", None)
+    context_tokens = getattr(
+        compressor,
+        "latest_provider_prompt_tokens",
+        None,
+    )
+    context_length = getattr(compressor, "context_length", None)
+    if (
+        type(context_tokens) is int
+        and type(context_length) is int
+        and 0 < context_tokens <= context_length <= 10**9
+    ):
+        usage["context_tokens"] = context_tokens
+        usage["context_length"] = context_length
+    return usage
+
+
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
     """Parse a listen port without letting malformed env/config values crash startup."""
     try:
@@ -5790,11 +5816,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
-                    usage = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
+                    usage = _agent_run_usage(agent)
                     # Include the effective session ID in the result so callers
                     # (e.g. X-Hermes-Session-Id header) can track compression-
                     # triggered session rotations. (#16938)
@@ -6243,6 +6265,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     if type(value) is not int or not (0 <= value <= 10**9):
                         return None
                     safe_usage[key] = value
+                context_tokens = usage.get("context_tokens")
+                context_length = usage.get("context_length")
+                if context_tokens is not None or context_length is not None:
+                    if (
+                        type(context_tokens) is int
+                        and type(context_length) is int
+                        and 0 < context_tokens <= context_length <= 10**9
+                    ):
+                        safe_usage["context_tokens"] = context_tokens
+                        safe_usage["context_length"] = context_length
                 published["usage"] = safe_usage
         else:
             return None
@@ -7042,11 +7074,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         clear_session_vars(session_tokens)
                                     except Exception:
                                         pass
-                        u = {
-                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                        }
+                        u = _agent_run_usage(agent)
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
@@ -7061,6 +7089,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
+                        usage=usage,
                         pending_action=None,
                     )
                 # Check for structured failure (non-retryable client errors like
@@ -7078,6 +7107,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "failed",
                         error=error_msg,
+                        usage=usage,
                         last_event="run.failed",
                         pending_action=None,
                     )

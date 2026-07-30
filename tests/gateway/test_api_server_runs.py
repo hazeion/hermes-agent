@@ -25,6 +25,7 @@ from gateway.platforms.api_server import (
     RUN_INLINE_IMAGE_MAX_COUNT,
     _RUN_EVENT_JOURNAL_MAX_BYTES,
     _RUN_EVENT_RETENTION,
+    _agent_run_usage,
     _approval_event_choices,
     _safe_approval_preview,
     _run_session_continuation_revision,
@@ -770,6 +771,8 @@ class TestRunStatus:
                 mock_agent.session_prompt_tokens = 4
                 mock_agent.session_completion_tokens = 2
                 mock_agent.session_total_tokens = 6
+                mock_agent.context_compressor.latest_provider_prompt_tokens = 2_048
+                mock_agent.context_compressor.context_length = 128_000
                 mock_create.return_value = mock_agent
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
@@ -787,7 +790,96 @@ class TestRunStatus:
                 assert status["status"] == "completed"
                 assert status["output"] == "done"
                 assert status["usage"]["total_tokens"] == 6
+                assert status["usage"]["context_tokens"] == 2_048
+                assert status["usage"]["context_length"] == 128_000
                 assert status["last_event"] == "run.completed"
+
+    def test_run_usage_omits_impossible_context_values(self):
+        mock_agent = MagicMock()
+        mock_agent.session_prompt_tokens = 4
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 6
+        mock_agent.context_compressor.latest_provider_prompt_tokens = 128_001
+        mock_agent.context_compressor.context_length = 128_000
+
+        usage = _agent_run_usage(mock_agent)
+        assert usage == {
+            "input_tokens": 4,
+            "output_tokens": 2,
+            "total_tokens": 6,
+        }
+        mock_agent.context_compressor.latest_provider_prompt_tokens = 0
+        assert _agent_run_usage(mock_agent) == usage
+        mock_agent.context_compressor.latest_provider_prompt_tokens = 2_048
+        mock_agent.context_compressor.context_length = 128_000
+        mock_agent.provider = "moa"
+        assert _agent_run_usage(mock_agent) == usage
+
+    @pytest.mark.asyncio
+    async def test_structured_failure_status_retains_context_usage(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "failed": True,
+                    "error": "provider rejected the request",
+                }
+                mock_agent.session_prompt_tokens = 4
+                mock_agent.session_completion_tokens = 2
+                mock_agent.session_total_tokens = 6
+                mock_agent.context_compressor.latest_provider_prompt_tokens = 2_048
+                mock_agent.context_compressor.context_length = 128_000
+                mock_create.return_value = mock_agent
+
+                started = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await started.json())["run_id"]
+                for _ in range(20):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "failed"
+        assert status["usage"]["context_tokens"] == 2_048
+        assert status["usage"]["context_length"] == 128_000
+
+    @pytest.mark.asyncio
+    async def test_post_result_cancellation_retains_context_usage(self, adapter):
+        app = _create_runs_app(adapter)
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def finish_after_stop(**_kwargs):
+            worker_started.set()
+            release_worker.wait(timeout=3)
+            return {"final_response": "finished while stop was pending"}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = finish_after_stop
+                mock_agent.session_prompt_tokens = 4
+                mock_agent.session_completion_tokens = 2
+                mock_agent.session_total_tokens = 6
+                mock_agent.context_compressor.latest_provider_prompt_tokens = 2_048
+                mock_agent.context_compressor.context_length = 128_000
+                mock_create.return_value = mock_agent
+
+                started = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await started.json())["run_id"]
+                assert await asyncio.to_thread(worker_started.wait, 2)
+                adapter._stopping_run_ids.add(run_id)
+                release_worker.set()
+                for _ in range(20):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "cancelled":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "cancelled"
+        assert status["usage"]["context_tokens"] == 2_048
+        assert status["usage"]["context_length"] == 128_000
 
     @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
@@ -851,6 +943,8 @@ class TestRunEvents:
                 mock_agent.session_prompt_tokens = 10
                 mock_agent.session_completion_tokens = 5
                 mock_agent.session_total_tokens = 15
+                mock_agent.context_compressor.latest_provider_prompt_tokens = 4_096
+                mock_agent.context_compressor.context_length = 200_000
                 mock_create.return_value = mock_agent
 
                 # Start run
@@ -867,6 +961,16 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+                events = [
+                    json.loads(line.removeprefix("data: "))
+                    for line in body.splitlines()
+                    if line.startswith("data: ")
+                ]
+                completed = next(
+                    event for event in events if event["event"] == "run.completed"
+                )
+                assert completed["usage"]["context_tokens"] == 4_096
+                assert completed["usage"]["context_length"] == 200_000
 
     @pytest.mark.asyncio
     async def test_approval_event_includes_request_id_and_safe_preview(self, adapter):

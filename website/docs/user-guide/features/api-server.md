@@ -406,11 +406,23 @@ Poll the current run state. This is useful for dashboards that need status witho
     "model": "anthropic/claude-sonnet-4"
   },
   "output": "Done.",
-  "usage": {"input_tokens": 50, "output_tokens": 200, "total_tokens": 250}
+  "usage": {
+    "input_tokens": 50,
+    "output_tokens": 200,
+    "total_tokens": 250,
+    "context_tokens": 24000,
+    "context_length": 128000
+  }
 }
 ```
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
+When the provider reports an exact prompt count, `usage.context_tokens` is the
+active prompt size for that turn and `usage.context_length` is the active
+model window. Hermes emits the two fields only as a valid pair. They are
+separate from cumulative billing totals and are omitted when the provider does
+not supply a trustworthy measurement. Multi-model MoA turns omit the pair
+because their combined advisor usage is not one active prompt size.
 While a run is waiting, runtimes advertising
 `run_pending_action_status` include the same bounded, request-bound approval or
 clarification object emitted by the stream. Clients may use it to recover the
