@@ -617,6 +617,8 @@ instead of dashboard routes or Kanban database files. Discover it first through
 | `GET` / `POST` | `/v1/kanban/tasks?board=default` | List tasks or create one idempotently |
 | `GET` | `/v1/kanban/tasks/{task_id}?board=default` | Exact task snapshot and revision |
 | `POST` | `/v1/kanban/tasks/{task_id}/actions?board=default` | Revision-bound action and read-back |
+| `GET` | `/v1/kanban/tasks/{task_id}/artifacts?board=default` | Bounded latest-completion artifact manifest |
+| `GET` | `/v1/kanban/tasks/{task_id}/artifacts/{artifact_id}?board=default` | Download one manifest-bound artifact |
 
 Task details include a `kanbanrev_…` revision. Send that exact value plus a
 new idempotency key with every action. The API rejects stale state before it
@@ -624,9 +626,28 @@ changes anything, and a safe retry returns fresh state without repeating the
 operation. Supported actions are `assign`, `comment`/`reply`, `promote`,
 `block`, `retry`, and `terminate`.
 
-The API intentionally omits attachment locations, worker PIDs and locks, run
+When `kanban_artifacts` version 1 is advertised, a completed API-created task
+may expose files explicitly declared by its latest successful
+`kanban_complete` call. Ordinary local Kanban tasks are never exposed through
+this remote API.
+The manifest contains opaque IDs, safe names, media types, byte counts,
+timestamps, and SHA-256 digests—never filesystem paths. Downloads require the
+same bearer authentication and set private/no-store and nosniff headers.
+
+The artifact surface allows at most 10 files, 100 MiB per file, and 250 MiB
+combined. It accepts common UTF-8 text/source formats and PNG, JPEG, GIF, or
+WebP images. Raster files must decode structurally, stay within fixed frame and
+pixel limits, and end at the format's real container terminator. Inputs,
+generic agent attachments, prose-mentioned paths, older
+retry outputs, HTML/SVG/PDF, archives, executables, links, malformed content,
+and recognizable credential material are not published. Consumers must verify
+the advertised digest and keep their own private snapshot when persistence is
+needed.
+
+The API otherwise omits attachment locations, worker PIDs and locks, run
 metadata, and raw event payloads. It is a server-to-server control surface, not
-a replacement for the authenticated interactive dashboard.
+a replacement for the authenticated interactive dashboard or a remote
+workspace browser.
 
 ## Long-term memory scoping (`X-Hermes-Session-Key`)
 

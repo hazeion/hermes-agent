@@ -79,6 +79,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -136,6 +137,9 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+KANBAN_ARTIFACT_MAX_BYTES = 100 * 1024 * 1024
+KANBAN_ARTIFACT_MAX_COUNT = 10
+KANBAN_ARTIFACT_MAX_TOTAL_BYTES = 250 * 1024 * 1024
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -3497,6 +3501,45 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
     ]
 
 
+def list_completion_attachments(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    limit: int,
+) -> tuple[list[Attachment], int]:
+    """Return a bounded latest-completion artifact page and its total count."""
+    bounded_limit = max(0, min(int(limit), 100))
+    total = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM task_attachments "
+            "WHERE task_id = ? AND uploaded_by = 'kanban_complete'",
+            (task_id,),
+        ).fetchone()[0]
+    )
+    rows = conn.execute(
+        "SELECT * FROM task_attachments "
+        "WHERE task_id = ? AND uploaded_by = 'kanban_complete' "
+        "ORDER BY created_at ASC, id ASC LIMIT ?",
+        (task_id, bounded_limit),
+    ).fetchall()
+    return (
+        [
+            Attachment(
+                id=row["id"],
+                task_id=row["task_id"],
+                filename=row["filename"],
+                stored_path=row["stored_path"],
+                content_type=row["content_type"],
+                size=row["size"] or 0,
+                uploaded_by=row["uploaded_by"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ],
+        total,
+    )
+
+
 def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
     r = conn.execute(
         "SELECT * FROM task_attachments WHERE id = ?", (attachment_id,)
@@ -4445,6 +4488,125 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _unlink_completion_paths(
+    task_id: str,
+    paths: Iterable[str],
+    *,
+    board: Optional[str],
+) -> None:
+    """Best-effort unlink only inside the task board's exact attachment directory."""
+    try:
+        directory = task_attachments_dir(
+            task_id,
+            board=board,
+        ).resolve(strict=True)
+        directory_details = directory.lstat()
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_directory = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or (
+                opened_directory.st_dev,
+                opened_directory.st_ino,
+            )
+            != (
+                directory_details.st_dev,
+                directory_details.st_ino,
+            )
+        ):
+            os.close(directory_fd)
+            return
+    except OSError:
+        return
+    try:
+        for raw in paths:
+            path = Path(str(raw))
+            if path.parent != directory or Path(path.name).name != path.name:
+                continue
+            try:
+                details = os.stat(
+                    path.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    stat.S_ISREG(details.st_mode)
+                    and not stat.S_ISLNK(details.st_mode)
+                    and details.st_nlink == 1
+                ):
+                    os.unlink(path.name, dir_fd=directory_fd)
+            except OSError:
+                continue
+    finally:
+        os.close(directory_fd)
+
+
+@contextlib.contextmanager
+def _completion_artifact_cleanup(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+):
+    """Clean replaced files after commit and staged files after rollback."""
+    task_row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    artifact_board: Optional[str] = get_current_board()
+    if (
+        task_row
+        and task_row["workspace_kind"] == "scratch"
+        and task_row["workspace_path"]
+    ):
+        is_managed, derived_board = _managed_scratch_path_info(
+            Path(task_row["workspace_path"]).expanduser()
+        )
+        if is_managed and derived_board is not None:
+            artifact_board = derived_board
+    previous = conn.execute(
+        "SELECT id, stored_path FROM task_attachments "
+        "WHERE task_id = ? AND uploaded_by = 'kanban_complete'",
+        (task_id,),
+    ).fetchall()
+    staged_paths: list[str] = []
+    try:
+        yield staged_paths
+    except Exception:
+        if isinstance(metadata, dict):
+            current = metadata.get("_staged_artifacts", [])
+            if isinstance(current, list):
+                staged_paths.extend(str(path) for path in current)
+        _unlink_completion_paths(
+            task_id,
+            staged_paths,
+            board=artifact_board,
+        )
+        raise
+    else:
+        remaining_ids = {
+            int(row[0])
+            for row in conn.execute(
+                "SELECT id FROM task_attachments WHERE task_id = ? "
+                "AND uploaded_by = 'kanban_complete'",
+                (task_id,),
+            ).fetchall()
+        }
+        _unlink_completion_paths(
+            task_id,
+            [
+                str(row["stored_path"])
+                for row in previous
+                if int(row["id"]) not in remaining_ids
+            ],
+            board=artifact_board,
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4515,7 +4677,11 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    with _completion_artifact_cleanup(
+        conn,
+        task_id,
+        metadata,
+    ) as staged_cleanup, write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4553,9 +4719,18 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        # A completed task exposes only the files from its latest successful
+        # completion. Retried work replaces the prior set atomically.
+        conn.execute(
+            "DELETE FROM task_attachments "
+            "WHERE task_id = ? AND uploaded_by = 'kanban_complete'",
+            (task_id,),
+        )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
+            staged = metadata.pop("_staged_artifacts", [])
+            staged_cleanup.extend(str(path) for path in staged)
+            for stored_path in staged:
                 path = Path(stored_path)
                 _insert_completion_attachment(
                     conn,
@@ -4675,10 +4850,16 @@ def _merge_completion_prose_artifacts(
     exists so cleanup cannot erase the file the user was promised.
     """
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        "SELECT workspace_kind, workspace_path, created_by FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+        return metadata
+    # API-created tasks are consumed by remote control planes. Never turn a
+    # path mentioned in model prose into a remotely downloadable artifact.
+    # Those workers must use the explicit ``artifacts`` completion field or
+    # the task-scoped attachment tool, both of which are validated below.
+    if row["created_by"] == "api_server":
         return metadata
     workspace = Path(row["workspace_path"]).expanduser()
     if not _is_managed_scratch_path(workspace):
@@ -4718,7 +4899,7 @@ def _persist_scratch_completion_artifacts(
         return
 
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        "SELECT workspace_kind, workspace_path, created_by FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
@@ -4733,11 +4914,84 @@ def _persist_scratch_completion_artifacts(
         workspace_root = workspace.resolve()
     except OSError:
         return
+    attachment_dir, attachment_dir_identity = _safe_completion_attachment_dir(
+        task_id,
+        board=board,
+    )
 
-    attachment_dir = task_attachments_dir(task_id, board=board)
+    # Keep Hermes's established local notifier behavior. Local workers may
+    # declare absolute deliverables outside scratch (for example /tmp/report);
+    # the notifier decides later whether those paths still exist. API-created
+    # tasks can cross a remote trust boundary, so only their exact managed
+    # workspace files are promoted into downloadable task attachments.
+    if row["created_by"] != "api_server":
+        persisted: list[str] = []
+        staged: list[str] = []
+        used_destinations: set[Path] = set()
+        for item in raw_artifacts:
+            artifact = str(item).strip() if isinstance(item, str) else ""
+            if not artifact:
+                continue
+            src = Path(artifact).expanduser()
+            try:
+                resolved_src = src.resolve()
+            except OSError:
+                persisted.append(artifact)
+                continue
+            if not resolved_src.is_relative_to(workspace_root):
+                persisted.append(artifact)
+                continue
+            if not src.is_file():
+                raise ArtifactPreservationError(
+                    f"declared scratch artifact is unavailable or not a regular file: {artifact}"
+                )
+            size = resolved_src.stat().st_size
+            if size > KANBAN_ATTACHMENT_MAX_BYTES:
+                raise ArtifactPreservationError(
+                    f"declared scratch artifact exceeds the "
+                    f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+                )
+            dest, destination_file = _open_completion_destination(
+                attachment_dir,
+                resolved_src.name,
+                used_destinations,
+                expected_directory_identity=attachment_dir_identity,
+            )
+            try:
+                with resolved_src.open("rb") as source_file, destination_file:
+                    copied = 0
+                    while chunk := source_file.read(1024 * 1024):
+                        copied += len(chunk)
+                        if copied > KANBAN_ATTACHMENT_MAX_BYTES:
+                            raise ArtifactPreservationError(
+                                f"declared scratch artifact grew beyond the size limit: {artifact}"
+                            )
+                        destination_file.write(chunk)
+            except Exception:
+                dest.unlink(missing_ok=True)
+                raise
+            used_destinations.add(dest)
+            persisted_path = str(dest.resolve())
+            persisted.append(persisted_path)
+            staged.append(persisted_path)
+        metadata["artifacts"] = persisted
+        metadata["_staged_artifacts"] = staged
+        return
+
     persisted: list[str] = []
     used_destinations: set[Path] = set()
     changed = False
+    declared = [
+        str(item).strip()
+        for item in raw_artifacts
+        if isinstance(item, str) and str(item).strip()
+    ]
+    if len(declared) > KANBAN_ARTIFACT_MAX_COUNT:
+        raise ArtifactPreservationError(
+            f"declared scratch artifacts exceed the {KANBAN_ARTIFACT_MAX_COUNT}-file limit"
+        )
+    combined_size = 0
+    copied_total = 0
 
     def _discard_copies() -> None:
         for copied in used_destinations:
@@ -4750,49 +5004,137 @@ def _persist_scratch_completion_artifacts(
         except OSError:
             pass
 
-    for item in raw_artifacts:
-        artifact = str(item).strip() if isinstance(item, str) else ""
-        if not artifact:
-            continue
+    for artifact in declared:
         src = Path(artifact).expanduser()
         try:
-            resolved_src = src.resolve()
+            source_details = src.lstat()
         except OSError:
-            persisted.append(artifact)
-            continue
-
-        if not resolved_src.is_relative_to(workspace_root):
-            persisted.append(artifact)
-            continue
-
-        if not src.is_file():
             _discard_copies()
             raise ArtifactPreservationError(
                 f"declared scratch artifact is unavailable or not a regular file: {artifact}"
             )
+        if stat.S_ISLNK(source_details.st_mode) or not stat.S_ISREG(source_details.st_mode):
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact must be a regular non-symlink file: {artifact}"
+            )
+        try:
+            resolved_src = src.resolve()
+        except OSError:
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact could not be resolved safely: {artifact}"
+            )
 
-        size = resolved_src.stat().st_size
-        if size > KANBAN_ATTACHMENT_MAX_BYTES:
+        if not resolved_src.is_relative_to(workspace_root):
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact is outside the managed task workspace: {artifact}"
+            )
+
+        if not src.is_absolute() or src != resolved_src:
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact path is not canonical: {artifact}"
+            )
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        source_fd = -1
+        try:
+            source_fd = os.open(resolved_src, flags)
+            opened_details = os.fstat(source_fd)
+        except OSError as exc:
+            if source_fd >= 0:
+                os.close(source_fd)
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact could not be opened safely: {artifact}"
+            ) from exc
+        if (
+            not stat.S_ISREG(opened_details.st_mode)
+            or opened_details.st_nlink != 1
+            or (
+                source_details.st_dev,
+                source_details.st_ino,
+                source_details.st_size,
+            )
+            != (
+                opened_details.st_dev,
+                opened_details.st_ino,
+                opened_details.st_size,
+            )
+        ):
+            os.close(source_fd)
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact changed before it could be preserved: {artifact}"
+            )
+
+        size = opened_details.st_size
+        if size > KANBAN_ARTIFACT_MAX_BYTES:
+            os.close(source_fd)
             _discard_copies()
             raise ArtifactPreservationError(
                 f"declared scratch artifact exceeds the "
-                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+                f"{KANBAN_ARTIFACT_MAX_BYTES}-byte limit: {artifact}"
+            )
+        if combined_size + size > KANBAN_ARTIFACT_MAX_TOTAL_BYTES:
+            os.close(source_fd)
+            _discard_copies()
+            raise ArtifactPreservationError(
+                "declared scratch artifacts exceed the combined "
+                f"{KANBAN_ARTIFACT_MAX_TOTAL_BYTES}-byte limit"
             )
 
         dest: Optional[Path] = None
         try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
+            dest, destination_file = _open_completion_destination(
+                attachment_dir,
+                resolved_src.name,
+                used_destinations,
+                expected_directory_identity=attachment_dir_identity,
+            )
+            with os.fdopen(source_fd, "rb") as source_file, destination_file:
+                source_fd = -1
                 copied = 0
                 while chunk := source_file.read(1024 * 1024):
                     copied += len(chunk)
-                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
+                    if copied > KANBAN_ARTIFACT_MAX_BYTES:
                         raise ArtifactPreservationError(
                             f"declared scratch artifact grew beyond the size limit: {artifact}"
                         )
+                    if copied_total + copied > KANBAN_ARTIFACT_MAX_TOTAL_BYTES:
+                        raise ArtifactPreservationError(
+                            "declared scratch artifacts grew beyond the combined "
+                            f"{KANBAN_ARTIFACT_MAX_TOTAL_BYTES}-byte limit"
+                        )
                     destination_file.write(chunk)
+                final_details = os.fstat(source_file.fileno())
+                if (
+                    final_details.st_dev,
+                    final_details.st_ino,
+                    final_details.st_size,
+                ) != (
+                    opened_details.st_dev,
+                    opened_details.st_ino,
+                    opened_details.st_size,
+                ) or copied != opened_details.st_size:
+                    raise ArtifactPreservationError(
+                        f"declared scratch artifact changed while it was preserved: {artifact}"
+                    )
+                if copied != size:
+                    raise ArtifactPreservationError(
+                        f"declared scratch artifact changed while it was preserved: {artifact}"
+                    )
+                combined_size += copied
+                if combined_size > KANBAN_ARTIFACT_MAX_TOTAL_BYTES:
+                    raise ArtifactPreservationError(
+                        "declared scratch artifacts exceed the combined "
+                        f"{KANBAN_ARTIFACT_MAX_TOTAL_BYTES}-byte limit"
+                    )
         except Exception as exc:
+            if source_fd >= 0:
+                os.close(source_fd)
             if dest is not None:
                 try:
                     dest.unlink(missing_ok=True)
@@ -4806,6 +5148,7 @@ def _persist_scratch_completion_artifacts(
             ) from exc
 
         used_destinations.add(dest)
+        copied_total += copied
         persisted.append(str(dest.resolve()))
         changed = True
 
@@ -4837,6 +5180,115 @@ def _insert_completion_attachment(
         task_id,
         "attached",
         {"filename": filename, "size": size, "by": "kanban_complete"},
+    )
+
+
+def _safe_completion_attachment_dir(
+    task_id: str,
+    *,
+    board: Optional[str],
+) -> tuple[Path, tuple[int, int]]:
+    """Create an owner-only, non-symlink task artifact directory."""
+    root = attachments_root(board=board)
+    if root.is_symlink():
+        raise ArtifactPreservationError("completion attachment root is unsafe")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root_details = root.lstat()
+    if not stat.S_ISDIR(root_details.st_mode):
+        raise ArtifactPreservationError("completion attachment root is unsafe")
+    if os.name == "posix":
+        root.chmod(0o700, follow_symlinks=False)
+    resolved_root = root.resolve(strict=True)
+    directory = root / task_id
+    if directory.is_symlink():
+        raise ArtifactPreservationError("completion attachment directory is unsafe")
+    directory.mkdir(mode=0o700, exist_ok=True)
+    details = directory.lstat()
+    resolved = directory.resolve(strict=True)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or resolved.parent != resolved_root
+        or resolved.name != task_id
+    ):
+        raise ArtifactPreservationError("completion attachment directory is unsafe")
+    if os.name == "posix":
+        directory.chmod(0o700, follow_symlinks=False)
+    resolved_details = resolved.stat()
+    if (resolved_details.st_dev, resolved_details.st_ino) != (
+        details.st_dev,
+        details.st_ino,
+    ):
+        raise ArtifactPreservationError("completion attachment directory changed")
+    return resolved, (int(details.st_dev), int(details.st_ino))
+
+
+def _open_completion_destination(
+    directory: Path,
+    filename: str,
+    used: set[Path],
+    *,
+    expected_directory_identity: tuple[int, int],
+) -> tuple[Path, Any]:
+    """Open a collision-free owner-only file relative to a verified directory."""
+    safe_name = Path(filename).name or "artifact"
+    stem = Path(safe_name).stem or "artifact"
+    suffix = Path(safe_name).suffix
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(directory, directory_flags)
+    try:
+        opened_directory = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or (
+                int(opened_directory.st_dev),
+                int(opened_directory.st_ino),
+            )
+            != expected_directory_identity
+        ):
+            raise ArtifactPreservationError(
+                "completion attachment directory changed"
+            )
+        for index in range(10_000):
+            candidate_name = (
+                safe_name if index == 0 else f"{stem}_{index}{suffix}"
+            )
+            candidate = directory / candidate_name
+            if candidate in used:
+                continue
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                descriptor = os.open(
+                    candidate_name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                continue
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+                os.close(descriptor)
+                candidate.unlink(missing_ok=True)
+                raise ArtifactPreservationError(
+                    "completion attachment destination is unsafe"
+                )
+            if os.name == "posix":
+                os.fchmod(descriptor, 0o600)
+            return candidate, os.fdopen(descriptor, "wb")
+    finally:
+        os.close(directory_fd)
+    raise ArtifactPreservationError(
+        "could not allocate a completion attachment destination"
     )
 
 
